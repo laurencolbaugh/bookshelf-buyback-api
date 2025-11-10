@@ -75,7 +75,7 @@ def _extract_tb_offer_from_item(item: Dict[str, Any]) -> Tuple[bool, Optional[fl
     """
     Interpret a single ThriftBooks quote object.
 
-    From your observation, we have:
+    From your observation, the response includes:
       - isAccepted: bool
       - quotePrice: number
 
@@ -85,8 +85,6 @@ def _extract_tb_offer_from_item(item: Dict[str, Any]) -> Tuple[bool, Optional[fl
       - If isAccepted == false -> not_accepted
     """
     is_accepted = bool(item.get("isAccepted", False))
-
-    # Some responses may use different casing; normalize just in case
     if "isaccepted" in item:
         is_accepted = bool(item.get("isaccepted", is_accepted))
 
@@ -121,8 +119,6 @@ async def check_thriftbooks_buyback(isbn: str) -> Tuple[bool, Optional[float], s
           "addedFrom": 3,
           "identifiers": ["<ISBN>"]
         }
-
-    This is designed for your personal, low-volume use.
     """
     payload = {
         "addedFrom": 3,
@@ -153,7 +149,6 @@ async def check_thriftbooks_buyback(isbn: str) -> Tuple[bool, Optional[float], s
         if isinstance(data, list):
             items = data
         elif isinstance(data, dict):
-            # Try a few obvious keys; if they change their shape you'll see "no_data"
             for key, val in data.items():
                 if isinstance(val, list):
                     items = val
@@ -162,7 +157,7 @@ async def check_thriftbooks_buyback(isbn: str) -> Tuple[bool, Optional[float], s
         if not items:
             return False, None, "no_data"
 
-        # Prefer an item that matches our ISBN if identifiable
+        # Try to match by identifier field if present
         chosen: Optional[dict] = None
         for item in items:
             if not isinstance(item, dict):
@@ -180,7 +175,7 @@ async def check_thriftbooks_buyback(isbn: str) -> Tuple[bool, Optional[float], s
                 break
 
         if chosen is None:
-            # Fallback: if there's only one item, assume it's for our ISBN
+            # If there's only one item, assume it's ours
             if len(items) == 1 and isinstance(items[0], dict):
                 chosen = items[0]
 
