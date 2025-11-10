@@ -1,8 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional, Tuple
 import httpx
+import os
 
 # ============================================================
 # FastAPI app setup
@@ -31,7 +33,7 @@ class ISBNResult(BaseModel):
     isbn: str
     title: Optional[str] = None
     author: Optional[str] = None
-    # Keep these fields for compatibility with your HTML, but they are stubbed.
+    # Kept for compatibility with your HTML; values are stubbed.
     thriftbooks_buyback: bool = False
     thriftbooks_price: Optional[float] = None
     thriftbooks_raw_status: Optional[str] = "not_implemented"
@@ -76,16 +78,13 @@ async def check_thriftbooks_buyback(isbn: str):
     Stub for compatibility.
 
     We intentionally DO NOT call ThriftBooks from the server because their
-    buyback API requires authenticated browser context (your session),
-    which a shared backend cannot safely or reliably replicate.
-
-    Returns a fixed "not_implemented" status so your UI logic still works.
+    buyback API requires your authenticated browser session.
     """
     return False, None, "not_implemented"
 
 
 # ============================================================
-# Main endpoint
+# Main API endpoint
 # ============================================================
 
 @app.post("/check-isbns", response_model=List[ISBNResult])
@@ -138,6 +137,25 @@ async def check_isbns(payload: ISBNRequest):
 
 
 # ============================================================
+# Serve the HTML tool
+# ============================================================
+
+@app.get("/bookshelf")
+async def serve_html():
+    """
+    Serve the bookshelf-buyback.html file so you can open it via:
+      /bookshelf
+    """
+    html_path = os.path.join(os.path.dirname(__file__), "bookshelf-buyback.html")
+    if not os.path.exists(html_path):
+        # Simple message if the file is missing
+        return {
+            "error": "bookshelf-buyback.html not found. Make sure it is in the repo root."
+        }
+    return FileResponse(html_path)
+
+
+# ============================================================
 # Healthcheck
 # ============================================================
 
@@ -146,13 +164,5 @@ async def root():
     return {
         "status": "ok",
         "message": "bookshelf-buyback-api is running",
-        "endpoints": ["/check-isbns"],
+        "endpoints": ["/check-isbns", "/bookshelf"],
     }
-
-from fastapi.responses import FileResponse
-import os
-
-@app.get("/bookshelf")
-async def serve_html():
-    html_path = os.path.join(os.path.dirname(__file__), "bookshelf-buyback.html")
-    return FileResponse(html_path)
