@@ -148,3 +148,11 @@ async def root():
         "message": "bookshelf-buyback-api is running",
         "endpoints": ["/check-isbns"],
     }
+
+from fastapi.responses import FileResponse
+import os
+
+@app.get("/bookshelf")
+async def serve_html():
+    html_path = os.path.join(os.path.dirname(__file__), "bookshelf-buyback.html")
+    return FileResponse(html_path)
