@@ -31,7 +31,7 @@ def check_isbns():
 def extract_ocr_lines(image: Image.Image) -> List[Dict]:
     """
     Preprocess + multi-orientation OCR.
-    Returns a list of high-level text lines with confidence.
+    Returns a list of text lines with average confidence.
     """
     all_lines: List[Dict] = []
 
@@ -39,7 +39,7 @@ def extract_ocr_lines(image: Image.Image) -> List[Dict]:
         try:
             rotated = image.rotate(angle, expand=True)
 
-            # Preprocessing tuned for book spines:
+            # Preprocess for better text clarity
             img = rotated.convert("L")  # grayscale
             img = ImageEnhance.Contrast(img).enhance(2.0)
             img = img.filter(ImageFilter.SHARPEN)
@@ -60,7 +60,11 @@ def extract_ocr_lines(image: Image.Image) -> List[Dict]:
         lines: Dict[tuple, Dict] = {}
 
         for i in range(n):
-            text = data["text"][i].strip()
+            raw = data["text"][i]
+            if not raw:
+                continue
+
+            text = raw.strip()
             if not text:
                 continue
 
@@ -95,7 +99,6 @@ def extract_ocr_lines(image: Image.Image) -> List[Dict]:
                 }
             )
 
-    # If nothing at all, try a basic fallback for debugging.
     if not all_lines:
         try:
             raw = pytesseract.image_to_string(image)
@@ -104,61 +107,87 @@ def extract_ocr_lines(image: Image.Image) -> List[Dict]:
             pass
         return []
 
-    # Sort by confidence, drop near-duplicates, drop very low-confidence
+    # Deduplicate & keep only reasonable-confidence lines
     deduped: List[Dict] = []
     seen = set()
     for entry in sorted(all_lines, key=lambda x: x["conf"], reverse=True):
         text = entry["text"].strip()
-        key = re.sub(r"\s+", " ", text.lower())
-        if entry["conf"] < 20:
+        if entry["conf"] < 15:  # toss ultra-low confidence
             continue
+        key = re.sub(r"\s+", " ", text.lower())
         if key in seen:
             continue
         seen.add(key)
         deduped.append({"text": text, "conf": entry["conf"]})
 
-    if len(deduped) <= 3:
-        logging.info(
-            "[DEBUG] Few OCR lines after filtering: %s",
-            [d["text"] for d in deduped],
-        )
+    if len(deduped) <= 5:
+        logging.info("[DEBUG] OCR lines after filtering: %s", [d["text"] for d in deduped])
 
     return deduped
 
 
+# ---------- CANDIDATE GENERATION ----------
+
+NOISE_TERMS = [
+    "isbn", "press", "edition", "publish", "printing",
+    "inc", "llc", "www", ".com"
+]
+
+def clean_line_to_titleish(text: str) -> Optional[str]:
+    """
+    Take a noisy OCR line and keep only plausible word tokens.
+    Returns cleaned string or None if it's junk.
+    """
+    # Only keep tokens that look like words/names (letters, hyphens, apostrophes)
+    tokens = re.findall(r"[A-Za-z][A-Za-z'\-]+", text)
+
+    if len(tokens) < 2:
+        return None  # need at least two tokens to be interesting
+
+    # Drop tokens that are clearly junk (all caps 2-3 letters)
+    filtered = []
+    for t in tokens:
+        if len(t) <= 2 and t.isupper():
+            continue
+        filtered.append(t)
+
+    if len(filtered) < 2:
+        return None
+
+    cleaned = " ".join(filtered)
+
+    # Noise screens
+    lower = cleaned.lower()
+    if any(term in lower for term in NOISE_TERMS):
+        return None
+
+    # Require at least one word length >= 4 to avoid fragments
+    if not any(len(w) >= 4 for w in filtered):
+        return None
+
+    return cleaned.strip()
+
+
 def generate_candidates(ocr_lines: List[Dict]) -> List[Dict]:
     """
-    Turn OCR lines into candidate book strings.
-    We favor lines that look like real titles (multiple words, mixed case).
+    Turn OCR lines into cleaned candidate strings.
+    These cleaned candidates are what we send to the metadata lookup.
     """
     candidates: List[Dict] = []
 
     for line in ocr_lines:
-        text = line["text"]
-
-        lower = text.lower()
-        # Filter obvious non-book noise
-        if any(bad in lower for bad in ["isbn", "press", "edition", "inc.", "llc", "www."]):
-            continue
-
-        words = re.findall(r"[A-Za-z0-9]+", text)
-
-        # Need at least 2 words OR one reasonably long word.
-        if len(words) < 2 and len(text) < 8:
-            continue
-
-        # Skip short shouty single words (likely spine fragments like "ARS", "HEL", etc.).
-        if len(words) == 1 and words[0].isupper() and len(words[0]) <= 5:
+        cleaned = clean_line_to_titleish(line["text"])
+        if not cleaned:
             continue
 
         candidates.append(
             {
-                "raw": text,
+                "raw": cleaned,
                 "ocr_conf": line["conf"],
             }
         )
 
-    logging.info("[DEBUG] Candidate lines: %s", [c["raw"] for c in candidates])
+    logging.info("[DEBUG] Candidates: %s", [c["raw"] for c in candidates])
 
     return candidates
 
@@ -187,7 +216,7 @@ def normalize_isbn(isbn: str) -> Optional[str]:
 
 def thriftbooks_lookup_stub(query: str) -> Optional[Dict]:
     """
-    Placeholder for a future ThriftBooks-first lookup.
+    Placeholder: ThriftBooks-first lookup would go here.
     """
     return None
 
@@ -199,7 +228,7 @@ def openlibrary_lookup(query: str) -> Optional[Dict]:
     try:
         resp = requests.get(
             "https://openlibrary.org/search.json",
-            params={"q": query, "limit": 3},
+            params={"q": query, "limit": 5},
             timeout=6,
         )
     except Exception as e:
@@ -223,9 +252,9 @@ def openlibrary_lookup(query: str) -> Optional[Dict]:
         if not isbns:
             continue
 
-        title = d.get("title") or ""
+        title = (d.get("title") or "").strip()
         authors = d.get("author_name") or []
-        author = authors[0] if authors else ""
+        author = authors[0].strip() if authors else ""
 
         chosen_isbn = None
         for raw in isbns:
@@ -236,6 +265,7 @@ def openlibrary_lookup(query: str) -> Optional[Dict]:
         if not chosen_isbn:
             continue
 
+        # Overlap-based score
         q_words = set(re.findall(r"[A-Za-z0-9]+", query.lower()))
         t_words = set(re.findall(r"[A-Za-z0-9]+", title.lower()))
         overlap = len(q_words & t_words)
@@ -256,7 +286,7 @@ def openlibrary_lookup(query: str) -> Optional[Dict]:
 
 def resolve_candidate(candidate: Dict) -> Dict:
     """
-    Try ThriftBooks (stub), then OpenLibrary, else return unmatched.
+    Try ThriftBooks (stub), then OpenLibrary; otherwise return unmatched.
     """
     query = candidate["raw"]
 
@@ -297,7 +327,7 @@ def resolve_candidate(candidate: Dict) -> Dict:
 @app.get("/", response_class=HTMLResponse)
 def index():
     """
-    Minimal phone-friendly UI for upload → table → copy ISBNs.
+    Minimal phone-friendly UI: upload → table → copy ISBNs.
     """
     return """
 <!doctype html>
@@ -420,7 +450,7 @@ async function processImage() {
       copyBtn.style.display = 'inline-block';
       status.textContent = `Done. ${isbnList.length} ISBNs ready to copy.`;
     } else {
-      status.textContent = 'Done. No ISBNs resolved — review titles and try again.';
+      status.textContent = 'Done. No ISBNs resolved — review titles and try again.`;
     }
   } catch (e) {
     console.error(e);
