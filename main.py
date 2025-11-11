@@ -10,6 +10,12 @@ from PIL import Image
 import pytesseract
 
 app = FastAPI(title="Bookshelf OCR → ThriftBooks Helper")
+@app.get("/check-isbns")
+def check_isbns():
+    return {
+        "status": "ok",
+        "message": "Bookshelf ISBN helper is running. Use '/' to upload a photo or '/api/bookshelf' for API access."
+    }
 
 # ---------- OCR HELPERS ----------
 
@@ -446,3 +452,4 @@ async def process_bookshelf(file: UploadFile = File(...)):
 
 # To run locally:
 # uvicorn main:app --host 0.0.0.0 --port 8000
+
