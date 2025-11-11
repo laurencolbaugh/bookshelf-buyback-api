@@ -1,20 +1,22 @@
 import io
 import re
+import logging
 from typing import List, Dict, Optional
 
 import requests
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse, HTMLResponse
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 import pytesseract
 from pytesseract import TesseractNotFoundError
 
-# Point pytesseract at the Tesseract binary location used in the Dockerfile.
-# (If running locally with a different path, adjust as needed.)
+# Point pytesseract to the correct binary inside the Docker image
 pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
-app = FastAPI(title="Bookshelf OCR → ThriftBooks Helper")
+# Enable console logging for debugging OCR output
+logging.basicConfig(level=logging.INFO)
 
+app = FastAPI(title="Bookshelf OCR → ThriftBooks Helper")
 
 @app.get("/check-isbns")
 def check_isbns():
@@ -23,29 +25,28 @@ def check_isbns():
         "message": "Bookshelf ISBN helper is running. Use '/' to upload a photo or '/api/bookshelf' for API access.",
     }
 
-
 # ---------- OCR HELPERS ----------
-
 
 def extract_ocr_lines(image: Image.Image) -> List[Dict]:
     """
-    Run Tesseract, return a list of lines:
-    [
-      {"text": "THE HUNGER GAMES", "conf": 92.3},
-      ...
-    ]
+    Preprocess the image for better OCR, then run Tesseract.
     """
     try:
-        data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+        # --- Preprocessing: improves contrast and clarity on book spines ---
+        img = image.convert("L")  # grayscale
+        img = ImageEnhance.Contrast(img).enhance(2.0)  # boost contrast
+        img = img.filter(ImageFilter.SHARPEN)
+        img = img.filter(ImageFilter.MedianFilter(size=3))
+
+        # Perform OCR
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
     except TesseractNotFoundError:
-        # Surface a clear error up to the API layer instead of 500-ing blindly
-        raise RuntimeError(
-            "Tesseract OCR is not available on the server. Check Dockerfile / environment."
-        )
+        raise RuntimeError("Tesseract OCR not found in environment.")
+    except Exception as e:
+        raise RuntimeError(f"OCR failed: {e}")
 
     n = len(data["text"])
-    lines: Dict[int, Dict] = {}
-
+    results = []
     for i in range(n):
         text = data["text"][i].strip()
         if not text:
@@ -54,62 +55,36 @@ def extract_ocr_lines(image: Image.Image) -> List[Dict]:
             conf = float(data["conf"][i])
         except ValueError:
             conf = -1.0
+        if len(text) >= 2 and not text.isdigit():
+            results.append({"text": text, "conf": conf})
 
-        line_num = data["line_num"][i]
-        if line_num not in lines:
-            lines[line_num] = {"texts": [], "confs": []}
-        lines[line_num]["texts"].append(text)
-        lines[line_num]["confs"].append(conf)
-
-    results = []
-    for ln, content in lines.items():
-        full_text = " ".join(content["texts"]).strip()
-        if not full_text:
-            continue
-        valid_confs = [c for c in content["confs"] if c >= 0]
-        avg_conf = (
-            sum(valid_confs) / len(valid_confs) if valid_confs else 0.0
-        )
-
-        # Filter obvious junk
-        if len(full_text) < 3:
-            continue
-
-        results.append({"text": full_text, "conf": avg_conf})
+    if len(results) <= 2:
+        logging.info("[DEBUG] Raw OCR sample: %s", data["text"][:50])
 
     return results
 
 
 def generate_candidates(ocr_lines: List[Dict]) -> List[Dict]:
     """
-    Basic heuristic:
-    - Keep lines that look like book-ish text.
-    - Later we can get fancier (clusters, orientation, etc.).
+    Heuristic filtering: keep only plausible book-like lines.
     """
     candidates = []
     for line in ocr_lines:
         text = line["text"]
 
-        # Drop lines that look like pure numbers / publisher junk
+        # Drop junk or publisher words
         if re.fullmatch(r"[0-9\W]+", text):
             continue
-
-        # Drop short all-lowercase noise
-        if len(text) < 6 and text.islower():
+        if len(text) < 3:
+            continue
+        if any(bad in text.lower() for bad in ["isbn", "penguin", "press", "edition"]):
             continue
 
-        candidates.append(
-            {
-                "raw": text,
-                "ocr_conf": line["conf"],
-            }
-        )
+        candidates.append({"raw": text, "ocr_conf": line["conf"]})
 
     return candidates
 
-
 # ---------- LOOKUP HELPERS ----------
-
 
 def normalize_isbn(isbn: str) -> Optional[str]:
     """Return 13-digit, no-hyphen ISBN if possible."""
@@ -119,7 +94,6 @@ def normalize_isbn(isbn: str) -> Optional[str]:
     if len(digits) == 13:
         return digits
     if len(digits) == 10:
-        # Convert ISBN-10 → ISBN-13
         core = "978" + digits[:-1]
         total = 0
         for i, ch in enumerate(core):
@@ -132,24 +106,14 @@ def normalize_isbn(isbn: str) -> Optional[str]:
 
 def thriftbooks_lookup_stub(query: str) -> Optional[Dict]:
     """
-    Placeholder for a ThriftBooks-first lookup.
-
-    Intent:
-    - Send `query` (title/author-ish) to ThriftBooks search.
-    - Take the *closest* match result.
-    - Extract canonical title, author, and ISBN13 they list.
-
-    Left as a stub:
-    - ThriftBooks does not expose a stable public API.
-    - Any scraping must respect their terms of use.
+    Placeholder for future ThriftBooks-first lookup.
     """
-    return None  # Hook for future ThriftBooks integration.
+    return None
 
 
 def openlibrary_lookup(query: str) -> Optional[Dict]:
     """
-    Fallback lookup via OpenLibrary.
-    Not ThriftBooks, but provides working metadata.
+    Fallback lookup using OpenLibrary API.
     """
     try:
         resp = requests.get(
@@ -170,33 +134,25 @@ def openlibrary_lookup(query: str) -> Optional[Dict]:
 
     best = None
     best_score = -1
-
     for d in docs:
         isbns = d.get("isbn") or []
         if not isbns:
             continue
-
         title = d.get("title") or ""
         authors = d.get("author_name") or []
         author = authors[0] if authors else ""
-
-        # Prefer 13-digit ISBN; otherwise convert.
         chosen_isbn = None
         for raw in isbns:
             norm = normalize_isbn(raw)
             if norm:
                 chosen_isbn = norm
                 break
-
         if not chosen_isbn:
             continue
-
-        # Soft score: overlapping words between query and title
         q_words = set(re.findall(r"[A-Za-z0-9]+", query.lower()))
         t_words = set(re.findall(r"[A-Za-z0-9]+", title.lower()))
         overlap = len(q_words & t_words)
         score = overlap
-
         if score > best_score:
             best_score = score
             best = {
@@ -206,18 +162,14 @@ def openlibrary_lookup(query: str) -> Optional[Dict]:
                 "source": "openlibrary",
                 "match_score": score,
             }
-
     return best
 
 
 def resolve_candidate(candidate: Dict) -> Dict:
     """
-    ThriftBooks-first resolution (stub), with OpenLibrary fallback.
-    Returns a unified record with confidence.
+    Try ThriftBooks (stub), then OpenLibrary, return unified result.
     """
     query = candidate["raw"]
-
-    # 1) Try ThriftBooks (stub for now)
     tb = thriftbooks_lookup_stub(query)
     if tb:
         return {
@@ -227,14 +179,11 @@ def resolve_candidate(candidate: Dict) -> Dict:
             "source": "thriftbooks",
             "confidence": min(0.99, 0.6 + candidate["ocr_conf"] / 100 * 0.4),
         }
-
-    # 2) Fallback: OpenLibrary
     ol = openlibrary_lookup(query)
     if ol:
         ocr_conf = max(0.0, min(candidate["ocr_conf"], 95.0)) / 100.0
         match_norm = 0.3 + 0.1 * (ol.get("match_score", 0))
         blended = max(0.3, min(0.98, 0.4 * ocr_conf + 0.6 * (match_norm / 3.0)))
-
         return {
             "title": ol["title"],
             "author": ol.get("author", ""),
@@ -242,27 +191,20 @@ def resolve_candidate(candidate: Dict) -> Dict:
             "source": ol.get("source", "openlibrary"),
             "confidence": round(blended, 2),
         }
-
-    # 3) No match
     return {
         "title": query,
         "author": "",
         "isbn": "",
         "source": "unmatched",
-        "confidence": round(candidate["ocr_conf"] / 200.0, 2),  # ~0–0.5
+        "confidence": round(candidate["ocr_conf"] / 200.0, 2),
     }
 
-
 # ---------- API ENDPOINTS ----------
-
 
 @app.get("/", response_class=HTMLResponse)
 def index():
     """
-    Minimal phone-friendly UI:
-    - Upload photo
-    - See table
-    - Copy ISBN column with one click
+    Minimal phone-friendly UI.
     """
     return """
 <!doctype html>
@@ -312,8 +254,7 @@ def index():
   </table>
 
   <textarea id="isbnBox" rows="4" readonly style="display:none;"></textarea>
-  <button id="copyBtn" class="secondary" style="display:none;" onclick="copyIsbns
-()">Copy ISBN Column</button>
+  <button id="copyBtn" class="secondary" style="display:none;" onclick="copyIsbns()">Copy ISBN Column</button>
 
 <script>
 async function processImage() {
@@ -420,52 +361,36 @@ async function copyIsbns() {
 </html>
     """
 
-
 @app.post("/api/bookshelf")
 async def process_bookshelf(file: UploadFile = File(...)):
     """
-    Core pipeline:
-    1. Load image
-    2. OCR → lines
-    3. Heuristic candidates
-    4. ThriftBooks-first (stub) / OpenLibrary fallback
-    5. Return structured list suitable for your table + ISBN paste
+    Core OCR → lookup pipeline.
     """
     content = await file.read()
     try:
         image = Image.open(io.BytesIO(content))
         image = image.convert("RGB")
     except Exception:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "Unable to read image file."},
-        )
+        return JSONResponse(status_code=400, content={"error": "Unable to read image file."})
 
     try:
         ocr_lines = extract_ocr_lines(image)
     except RuntimeError as e:
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)},
-        )
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
     candidates = generate_candidates(ocr_lines)
 
     books = []
-    pos = 1
-    for cand in candidates:
+    for i, cand in enumerate(candidates, start=1):
         resolved = resolve_candidate(cand)
-        books.append(
-            {
-                "position": pos,
-                "title": resolved["title"],
-                "author": resolved.get("author", ""),
-                "isbn": resolved.get("isbn", ""),
-                "confidence": resolved.get("confidence", 0.0),
-                "source": resolved.get("source", "unknown"),
-            }
-        )
-        pos += 1
+        books.append({
+            "position": i,
+            "title": resolved["title"],
+            "author": resolved.get("author", ""),
+            "isbn": resolved.get("isbn", ""),
+            "confidence": resolved.get("confidence", 0.0),
+            "source": resolved.get("source", "unknown"),
+        })
 
     return {"books": books}
 
