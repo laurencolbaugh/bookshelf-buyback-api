@@ -1,6 +1,5 @@
 import io
 import re
-import math
 from typing import List, Dict, Optional
 
 import requests
@@ -8,16 +7,25 @@ from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse, HTMLResponse
 from PIL import Image
 import pytesseract
+from pytesseract import TesseractNotFoundError
+
+# Point pytesseract at the Tesseract binary location used in the Dockerfile.
+# (If running locally with a different path, adjust as needed.)
+pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
 app = FastAPI(title="Bookshelf OCR → ThriftBooks Helper")
+
+
 @app.get("/check-isbns")
 def check_isbns():
     return {
         "status": "ok",
-        "message": "Bookshelf ISBN helper is running. Use '/' to upload a photo or '/api/bookshelf' for API access."
+        "message": "Bookshelf ISBN helper is running. Use '/' to upload a photo or '/api/bookshelf' for API access.",
     }
 
+
 # ---------- OCR HELPERS ----------
+
 
 def extract_ocr_lines(image: Image.Image) -> List[Dict]:
     """
@@ -27,10 +35,17 @@ def extract_ocr_lines(image: Image.Image) -> List[Dict]:
       ...
     ]
     """
-    data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
-    n = len(data["text"])
+    try:
+        data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+    except TesseractNotFoundError:
+        # Surface a clear error up to the API layer instead of 500-ing blindly
+        raise RuntimeError(
+            "Tesseract OCR is not available on the server. Check Dockerfile / environment."
+        )
 
+    n = len(data["text"])
     lines: Dict[int, Dict] = {}
+
     for i in range(n):
         text = data["text"][i].strip()
         if not text:
@@ -51,12 +66,15 @@ def extract_ocr_lines(image: Image.Image) -> List[Dict]:
         full_text = " ".join(content["texts"]).strip()
         if not full_text:
             continue
-        avg_conf = sum(c for c in content["confs"] if c >= 0) / max(
-            1, len([c for c in content["confs"] if c >= 0])
+        valid_confs = [c for c in content["confs"] if c >= 0]
+        avg_conf = (
+            sum(valid_confs) / len(valid_confs) if valid_confs else 0.0
         )
+
         # Filter obvious junk
         if len(full_text) < 3:
             continue
+
         results.append({"text": full_text, "conf": avg_conf})
 
     return results
@@ -76,7 +94,7 @@ def generate_candidates(ocr_lines: List[Dict]) -> List[Dict]:
         if re.fullmatch(r"[0-9\W]+", text):
             continue
 
-        # Drop all-lowercase noise
+        # Drop short all-lowercase noise
         if len(text) < 6 and text.islower():
             continue
 
@@ -91,6 +109,7 @@ def generate_candidates(ocr_lines: List[Dict]) -> List[Dict]:
 
 
 # ---------- LOOKUP HELPERS ----------
+
 
 def normalize_isbn(isbn: str) -> Optional[str]:
     """Return 13-digit, no-hyphen ISBN if possible."""
@@ -120,24 +139,17 @@ def thriftbooks_lookup_stub(query: str) -> Optional[Dict]:
     - Take the *closest* match result.
     - Extract canonical title, author, and ISBN13 they list.
 
-    This is left as a stub because:
-    - ThriftBooks does not provide a stable, documented public API.
-    - Their HTML structure may change.
+    Left as a stub:
+    - ThriftBooks does not expose a stable public API.
     - Any scraping must respect their terms of use.
-
-    If you decide to implement:
-    - Use requests.get() to hit their search page with `b.search=query`.
-    - Parse the first strong match with BeautifulSoup.
-    - Grab title, author, and the ISBN/ISBN13 from the product block.
-    - Return in the schema below.
     """
-    return None  # No-op for now; real logic goes here when you're ready.
+    return None  # Hook for future ThriftBooks integration.
 
 
 def openlibrary_lookup(query: str) -> Optional[Dict]:
     """
     Fallback lookup via OpenLibrary.
-    Not ThriftBooks, but gives us real, working metadata today.
+    Not ThriftBooks, but provides working metadata.
     """
     try:
         resp = requests.get(
@@ -156,7 +168,6 @@ def openlibrary_lookup(query: str) -> Optional[Dict]:
     if not docs:
         return None
 
-    # Simple: pick the first doc that has an ISBN.
     best = None
     best_score = -1
 
@@ -180,7 +191,7 @@ def openlibrary_lookup(query: str) -> Optional[Dict]:
         if not chosen_isbn:
             continue
 
-        # Soft score: longer overlapping words between query and title
+        # Soft score: overlapping words between query and title
         q_words = set(re.findall(r"[A-Za-z0-9]+", query.lower()))
         t_words = set(re.findall(r"[A-Za-z0-9]+", title.lower()))
         overlap = len(q_words & t_words)
@@ -201,15 +212,14 @@ def openlibrary_lookup(query: str) -> Optional[Dict]:
 
 def resolve_candidate(candidate: Dict) -> Dict:
     """
-    ThriftBooks-first resolution, with OpenLibrary fallback.
+    ThriftBooks-first resolution (stub), with OpenLibrary fallback.
     Returns a unified record with confidence.
     """
     query = candidate["raw"]
 
-    # 1) Try ThriftBooks (stubbed for now)
+    # 1) Try ThriftBooks (stub for now)
     tb = thriftbooks_lookup_stub(query)
     if tb:
-        # You can tune these once real TB data is wired in
         return {
             "title": tb["title"],
             "author": tb.get("author", ""),
@@ -221,7 +231,6 @@ def resolve_candidate(candidate: Dict) -> Dict:
     # 2) Fallback: OpenLibrary
     ol = openlibrary_lookup(query)
     if ol:
-        # Blend OCR confidence and match_score (very rough)
         ocr_conf = max(0.0, min(candidate["ocr_conf"], 95.0)) / 100.0
         match_norm = 0.3 + 0.1 * (ol.get("match_score", 0))
         blended = max(0.3, min(0.98, 0.4 * ocr_conf + 0.6 * (match_norm / 3.0)))
@@ -234,17 +243,18 @@ def resolve_candidate(candidate: Dict) -> Dict:
             "confidence": round(blended, 2),
         }
 
-    # 3) No match: return raw text, low confidence, blank ISBN
+    # 3) No match
     return {
         "title": query,
         "author": "",
         "isbn": "",
         "source": "unmatched",
-        "confidence": round(candidate["ocr_conf"] / 200.0, 2),  # 0–0.5 range-ish
+        "confidence": round(candidate["ocr_conf"] / 200.0, 2),  # ~0–0.5
     }
 
 
 # ---------- API ENDPOINTS ----------
+
 
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -302,7 +312,8 @@ def index():
   </table>
 
   <textarea id="isbnBox" rows="4" readonly style="display:none;"></textarea>
-  <button id="copyBtn" class="secondary" style="display:none;" onclick="copyIsbns()">Copy ISBN Column</button>
+  <button id="copyBtn" class="secondary" style="display:none;" onclick="copyIsbns
+()">Copy ISBN Column</button>
 
 <script>
 async function processImage() {
@@ -336,7 +347,9 @@ async function processImage() {
     });
 
     if (!resp.ok) {
-      status.textContent = 'Error from server. Try a clearer photo.';
+      const errText = await resp.text().catch(() => '');
+      console.error('Server error:', errText);
+      status.textContent = 'Error from server. Try a clearer photo or check logs.';
       return;
     }
 
@@ -428,7 +441,14 @@ async def process_bookshelf(file: UploadFile = File(...)):
             content={"error": "Unable to read image file."},
         )
 
-    ocr_lines = extract_ocr_lines(image)
+    try:
+        ocr_lines = extract_ocr_lines(image)
+    except RuntimeError as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)},
+        )
+
     candidates = generate_candidates(ocr_lines)
 
     books = []
@@ -449,7 +469,5 @@ async def process_bookshelf(file: UploadFile = File(...)):
 
     return {"books": books}
 
-
 # To run locally:
 # uvicorn main:app --host 0.0.0.0 --port 8000
-
