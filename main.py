@@ -10,13 +10,13 @@ from PIL import Image, ImageEnhance, ImageFilter
 import pytesseract
 from pytesseract import TesseractNotFoundError
 
-# Point pytesseract to the correct binary inside the Docker image
+# Point pytesseract to the Tesseract binary inside our Docker image.
 pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
-# Enable console logging for debugging OCR output
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Bookshelf OCR → ThriftBooks Helper")
+
 
 @app.get("/check-isbns")
 def check_isbns():
@@ -25,69 +25,150 @@ def check_isbns():
         "message": "Bookshelf ISBN helper is running. Use '/' to upload a photo or '/api/bookshelf' for API access.",
     }
 
+
 # ---------- OCR HELPERS ----------
 
 def extract_ocr_lines(image: Image.Image) -> List[Dict]:
     """
-    Preprocess the image for better OCR, then run Tesseract.
+    Preprocess + multi-orientation OCR.
+    Returns a list of high-level text lines with confidence.
     """
-    try:
-        # --- Preprocessing: improves contrast and clarity on book spines ---
-        img = image.convert("L")  # grayscale
-        img = ImageEnhance.Contrast(img).enhance(2.0)  # boost contrast
-        img = img.filter(ImageFilter.SHARPEN)
-        img = img.filter(ImageFilter.MedianFilter(size=3))
+    all_lines: List[Dict] = []
 
-        # Perform OCR
-        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
-    except TesseractNotFoundError:
-        raise RuntimeError("Tesseract OCR not found in environment.")
-    except Exception as e:
-        raise RuntimeError(f"OCR failed: {e}")
-
-    n = len(data["text"])
-    results = []
-    for i in range(n):
-        text = data["text"][i].strip()
-        if not text:
-            continue
+    for angle in (0, 90, 270):
         try:
-            conf = float(data["conf"][i])
-        except ValueError:
-            conf = -1.0
-        if len(text) >= 2 and not text.isdigit():
-            results.append({"text": text, "conf": conf})
+            rotated = image.rotate(angle, expand=True)
 
-    if len(results) <= 2:
-        logging.info("[DEBUG] Raw OCR sample: %s", data["text"][:50])
+            # Preprocessing tuned for book spines:
+            img = rotated.convert("L")  # grayscale
+            img = ImageEnhance.Contrast(img).enhance(2.0)
+            img = img.filter(ImageFilter.SHARPEN)
+            img = img.filter(ImageFilter.MedianFilter(size=3))
 
-    return results
+            data = pytesseract.image_to_data(
+                img,
+                output_type=pytesseract.Output.DICT,
+                config="--psm 6 --oem 3",
+            )
+        except TesseractNotFoundError:
+            raise RuntimeError("Tesseract OCR not found in environment.")
+        except Exception as e:
+            logging.error("OCR failure at angle %s: %s", angle, e)
+            continue
+
+        n = len(data["text"])
+        lines: Dict[tuple, Dict] = {}
+
+        for i in range(n):
+            text = data["text"][i].strip()
+            if not text:
+                continue
+
+            conf_str = data.get("conf", ["-1"] * n)[i]
+            try:
+                conf = float(conf_str)
+            except (ValueError, TypeError):
+                conf = -1.0
+            if conf < 0:
+                continue
+
+            key = (
+                data.get("block_num", [0] * n)[i],
+                data.get("par_num", [0] * n)[i],
+                data.get("line_num", [0] * n)[i],
+            )
+            if key not in lines:
+                lines[key] = {"texts": [], "confs": []}
+            lines[key]["texts"].append(text)
+            lines[key]["confs"].append(conf)
+
+        for key, content in lines.items():
+            full_text = " ".join(content["texts"]).strip()
+            if len(full_text) < 3:
+                continue
+            avg_conf = sum(content["confs"]) / len(content["confs"])
+            all_lines.append(
+                {
+                    "text": full_text,
+                    "conf": avg_conf,
+                    "angle": angle,
+                }
+            )
+
+    # If nothing at all, try a basic fallback for debugging.
+    if not all_lines:
+        try:
+            raw = pytesseract.image_to_string(image)
+            logging.info("[DEBUG] Fallback OCR sample: %s", raw[:200])
+        except Exception:
+            pass
+        return []
+
+    # Sort by confidence, drop near-duplicates, drop very low-confidence
+    deduped: List[Dict] = []
+    seen = set()
+    for entry in sorted(all_lines, key=lambda x: x["conf"], reverse=True):
+        text = entry["text"].strip()
+        key = re.sub(r"\s+", " ", text.lower())
+        if entry["conf"] < 20:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append({"text": text, "conf": entry["conf"]})
+
+    if len(deduped) <= 3:
+        logging.info(
+            "[DEBUG] Few OCR lines after filtering: %s",
+            [d["text"] for d in deduped],
+        )
+
+    return deduped
 
 
 def generate_candidates(ocr_lines: List[Dict]) -> List[Dict]:
     """
-    Heuristic filtering: keep only plausible book-like lines.
+    Turn OCR lines into candidate book strings.
+    We favor lines that look like real titles (multiple words, mixed case).
     """
-    candidates = []
+    candidates: List[Dict] = []
+
     for line in ocr_lines:
         text = line["text"]
 
-        # Drop junk or publisher words
-        if re.fullmatch(r"[0-9\W]+", text):
-            continue
-        if len(text) < 3:
-            continue
-        if any(bad in text.lower() for bad in ["isbn", "penguin", "press", "edition"]):
+        lower = text.lower()
+        # Filter obvious non-book noise
+        if any(bad in lower for bad in ["isbn", "press", "edition", "inc.", "llc", "www."]):
             continue
 
-        candidates.append({"raw": text, "ocr_conf": line["conf"]})
+        words = re.findall(r"[A-Za-z0-9]+", text)
+
+        # Need at least 2 words OR one reasonably long word.
+        if len(words) < 2 and len(text) < 8:
+            continue
+
+        # Skip short shouty single words (likely spine fragments like "ARS", "HEL", etc.).
+        if len(words) == 1 and words[0].isupper() and len(words[0]) <= 5:
+            continue
+
+        candidates.append(
+            {
+                "raw": text,
+                "ocr_conf": line["conf"],
+            }
+        )
+
+    logging.info("[DEBUG] Candidate lines: %s", [c["raw"] for c in candidates])
 
     return candidates
+
 
 # ---------- LOOKUP HELPERS ----------
 
 def normalize_isbn(isbn: str) -> Optional[str]:
-    """Return 13-digit, no-hyphen ISBN if possible."""
+    """
+    Return 13-digit, no-hyphen ISBN if possible.
+    """
     if not isbn:
         return None
     digits = re.sub(r"\D", "", isbn)
@@ -106,14 +187,14 @@ def normalize_isbn(isbn: str) -> Optional[str]:
 
 def thriftbooks_lookup_stub(query: str) -> Optional[Dict]:
     """
-    Placeholder for future ThriftBooks-first lookup.
+    Placeholder for a future ThriftBooks-first lookup.
     """
     return None
 
 
 def openlibrary_lookup(query: str) -> Optional[Dict]:
     """
-    Fallback lookup using OpenLibrary API.
+    Fallback lookup via OpenLibrary.
     """
     try:
         resp = requests.get(
@@ -121,10 +202,12 @@ def openlibrary_lookup(query: str) -> Optional[Dict]:
             params={"q": query, "limit": 3},
             timeout=6,
         )
-    except Exception:
+    except Exception as e:
+        logging.error("OpenLibrary request failed: %s", e)
         return None
 
     if resp.status_code != 200:
+        logging.error("OpenLibrary bad status: %s", resp.status_code)
         return None
 
     data = resp.json()
@@ -134,13 +217,16 @@ def openlibrary_lookup(query: str) -> Optional[Dict]:
 
     best = None
     best_score = -1
+
     for d in docs:
         isbns = d.get("isbn") or []
         if not isbns:
             continue
+
         title = d.get("title") or ""
         authors = d.get("author_name") or []
         author = authors[0] if authors else ""
+
         chosen_isbn = None
         for raw in isbns:
             norm = normalize_isbn(raw)
@@ -149,10 +235,12 @@ def openlibrary_lookup(query: str) -> Optional[Dict]:
                 break
         if not chosen_isbn:
             continue
+
         q_words = set(re.findall(r"[A-Za-z0-9]+", query.lower()))
         t_words = set(re.findall(r"[A-Za-z0-9]+", title.lower()))
         overlap = len(q_words & t_words)
         score = overlap
+
         if score > best_score:
             best_score = score
             best = {
@@ -162,14 +250,16 @@ def openlibrary_lookup(query: str) -> Optional[Dict]:
                 "source": "openlibrary",
                 "match_score": score,
             }
+
     return best
 
 
 def resolve_candidate(candidate: Dict) -> Dict:
     """
-    Try ThriftBooks (stub), then OpenLibrary, return unified result.
+    Try ThriftBooks (stub), then OpenLibrary, else return unmatched.
     """
     query = candidate["raw"]
+
     tb = thriftbooks_lookup_stub(query)
     if tb:
         return {
@@ -179,6 +269,7 @@ def resolve_candidate(candidate: Dict) -> Dict:
             "source": "thriftbooks",
             "confidence": min(0.99, 0.6 + candidate["ocr_conf"] / 100 * 0.4),
         }
+
     ol = openlibrary_lookup(query)
     if ol:
         ocr_conf = max(0.0, min(candidate["ocr_conf"], 95.0)) / 100.0
@@ -191,6 +282,7 @@ def resolve_candidate(candidate: Dict) -> Dict:
             "source": ol.get("source", "openlibrary"),
             "confidence": round(blended, 2),
         }
+
     return {
         "title": query,
         "author": "",
@@ -199,12 +291,13 @@ def resolve_candidate(candidate: Dict) -> Dict:
         "confidence": round(candidate["ocr_conf"] / 200.0, 2),
     }
 
+
 # ---------- API ENDPOINTS ----------
 
 @app.get("/", response_class=HTMLResponse)
 def index():
     """
-    Minimal phone-friendly UI.
+    Minimal phone-friendly UI for upload → table → copy ISBNs.
     """
     return """
 <!doctype html>
@@ -361,17 +454,21 @@ async function copyIsbns() {
 </html>
     """
 
+
 @app.post("/api/bookshelf")
 async def process_bookshelf(file: UploadFile = File(...)):
     """
-    Core OCR → lookup pipeline.
+    Core OCR → candidate → lookup pipeline.
     """
     content = await file.read()
     try:
         image = Image.open(io.BytesIO(content))
         image = image.convert("RGB")
     except Exception:
-        return JSONResponse(status_code=400, content={"error": "Unable to read image file."})
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Unable to read image file."},
+        )
 
     try:
         ocr_lines = extract_ocr_lines(image)
@@ -381,16 +478,18 @@ async def process_bookshelf(file: UploadFile = File(...)):
     candidates = generate_candidates(ocr_lines)
 
     books = []
-    for i, cand in enumerate(candidates, start=1):
+    for idx, cand in enumerate(candidates, start=1):
         resolved = resolve_candidate(cand)
-        books.append({
-            "position": i,
-            "title": resolved["title"],
-            "author": resolved.get("author", ""),
-            "isbn": resolved.get("isbn", ""),
-            "confidence": resolved.get("confidence", 0.0),
-            "source": resolved.get("source", "unknown"),
-        })
+        books.append(
+            {
+                "position": idx,
+                "title": resolved["title"],
+                "author": resolved.get("author", ""),
+                "isbn": resolved.get("isbn", ""),
+                "confidence": resolved.get("confidence", 0.0),
+                "source": resolved.get("source", "unknown"),
+            }
+        )
 
     return {"books": books}
 
