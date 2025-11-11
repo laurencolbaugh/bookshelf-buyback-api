@@ -86,7 +86,7 @@ def extract_ocr_lines(image: Image.Image) -> List[Dict]:
             lines[key]["texts"].append(text)
             lines[key]["confs"].append(conf)
 
-        for key, content in lines.items():
+        for _, content in lines.items():
             full_text = " ".join(content["texts"]).strip()
             if len(full_text) < 3:
                 continue
@@ -133,18 +133,17 @@ NOISE_TERMS = [
     "inc", "llc", "www", ".com"
 ]
 
+
 def clean_line_to_titleish(text: str) -> Optional[str]:
     """
     Take a noisy OCR line and keep only plausible word tokens.
     Returns cleaned string or None if it's junk.
     """
-    # Only keep tokens that look like words/names (letters, hyphens, apostrophes)
     tokens = re.findall(r"[A-Za-z][A-Za-z'\-]+", text)
 
     if len(tokens) < 2:
         return None  # need at least two tokens to be interesting
 
-    # Drop tokens that are clearly junk (all caps 2-3 letters)
     filtered = []
     for t in tokens:
         if len(t) <= 2 and t.isupper():
@@ -155,13 +154,11 @@ def clean_line_to_titleish(text: str) -> Optional[str]:
         return None
 
     cleaned = " ".join(filtered)
-
-    # Noise screens
     lower = cleaned.lower()
+
     if any(term in lower for term in NOISE_TERMS):
         return None
 
-    # Require at least one word length >= 4 to avoid fragments
     if not any(len(w) >= 4 for w in filtered):
         return None
 
@@ -170,8 +167,7 @@ def clean_line_to_titleish(text: str) -> Optional[str]:
 
 def generate_candidates(ocr_lines: List[Dict]) -> List[Dict]:
     """
-    Turn OCR lines into cleaned candidate strings.
-    These cleaned candidates are what we send to the metadata lookup.
+    Turn OCR lines into cleaned candidate strings for lookup.
     """
     candidates: List[Dict] = []
 
@@ -265,7 +261,6 @@ def openlibrary_lookup(query: str) -> Optional[Dict]:
         if not chosen_isbn:
             continue
 
-        # Overlap-based score
         q_words = set(re.findall(r"[A-Za-z0-9]+", query.lower()))
         t_words = set(re.findall(r"[A-Za-z0-9]+", title.lower()))
         overlap = len(q_words & t_words)
@@ -450,7 +445,7 @@ async function processImage() {
       copyBtn.style.display = 'inline-block';
       status.textContent = `Done. ${isbnList.length} ISBNs ready to copy.`;
     } else {
-      status.textContent = 'Done. No ISBNs resolved — review titles and try again.`;
+      status.textContent = 'Done. No ISBNs resolved — review titles and try again.';
     }
   } catch (e) {
     console.error(e);
