@@ -335,26 +335,40 @@ def index():
     body { font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif; padding: 16px; background:#faf7f2; color:#222; }
     h1 { font-size: 1.3rem; margin-bottom: 0.3rem; }
     p { font-size: 0.9rem; margin-top: 0; margin-bottom: 0.8rem; }
-    input[type=file] { margin: 8px 0 12px; }
-    button { padding: 8px 14px; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9rem; }
+    button { padding: 10px 14px; border: none; border-radius: 8px; cursor: pointer; font-size: 0.95rem; }
     button.primary { background: #4b6b5c; color: #fff; }
     button.secondary { background: #e6e2db; color: #333; margin-left: 8px; }
+    button.ghost { background: #fff; color:#333; border:1px solid #d8d2c8; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; margin: 10px 0 12px; }
+    .row button { flex: 1 1 160px; }
     table { border-collapse: collapse; width: 100%; font-size: 0.8rem; margin-top: 12px; }
     th, td { border: 1px solid #ddd; padding: 6px; text-align: left; }
     th { background: #f1ece4; }
-    #status { font-size: 0.8rem; margin-top: 6px; color:#555; }
-    #isbnBox { width: 100%; margin-top: 8px; font-size: 0.75rem; padding:6px; }
+    #status { font-size: 0.85rem; margin-top: 8px; color:#555; white-space: pre-line; }
+    #isbnBox { width: 100%; margin-top: 8px; font-size: 0.8rem; padding:8px; box-sizing:border-box; }
+    #fileName { font-size: 0.85rem; color:#333; margin-top: 6px; }
+    .muted { color:#666; font-size:0.85rem; }
   </style>
 </head>
 <body>
   <h1>Bookshelf → ThriftBooks ISBN Helper</h1>
-  <p>Upload a clear shelf photo. I’ll OCR the spines, resolve against book data, and give you a clean ISBN column to paste into ThriftBooks buyback.</p>
+  <p>Upload a clear shelf photo. I’ll OCR the spines, resolve against book data, and give you a clean ISBN column.</p>
 
-  <!-- FIX: removed capture="environment" so iPhone offers Photo Library -->
-  <input id="file" type="file" accept="image/*" />
-  <br/>
-  <button class="primary" onclick="processImage()">Process Photo</button>
-  <button class="secondary" onclick="clearAll()">Clear</button>
+  <!-- Hidden inputs: one forces camera, one allows library -->
+  <input id="fileCamera" type="file" accept="image/*" capture="environment" style="display:none" />
+  <input id="fileLibrary" type="file" accept="image/*" style="display:none" />
+
+  <div class="row">
+    <button class="ghost" onclick="chooseCamera()">Take Photo</button>
+    <button class="ghost" onclick="chooseLibrary()">Choose from Library</button>
+  </div>
+
+  <div id="fileName" class="muted">No photo selected.</div>
+
+  <div class="row">
+    <button class="primary" onclick="processImage()">Process Photo</button>
+    <button class="secondary" onclick="clearAll()">Clear</button>
+  </div>
 
   <div id="status"></div>
 
@@ -376,22 +390,44 @@ def index():
   <button id="copyBtn" class="secondary" style="display:none;" onclick="copyIsbns()">Copy ISBN Column</button>
 
 <script>
+let selectedFile = null;
+
+function setSelectedFile(file) {
+  selectedFile = file || null;
+  const fileNameEl = document.getElementById('fileName');
+  fileNameEl.textContent = selectedFile ? ("Selected: " + (selectedFile.name || "photo")) : "No photo selected.";
+}
+
+function chooseCamera() {
+  document.getElementById('fileCamera').click();
+}
+
+function chooseLibrary() {
+  document.getElementById('fileLibrary').click();
+}
+
+document.getElementById('fileCamera').addEventListener('change', (e) => {
+  setSelectedFile(e.target.files && e.target.files[0]);
+});
+
+document.getElementById('fileLibrary').addEventListener('change', (e) => {
+  setSelectedFile(e.target.files && e.target.files[0]);
+});
+
 async function processImage() {
-  const fileInput = document.getElementById('file');
   const status = document.getElementById('status');
   const table = document.getElementById('resultsTable');
   const tbody = table.querySelector('tbody');
   const isbnBox = document.getElementById('isbnBox');
   const copyBtn = document.getElementById('copyBtn');
 
-  if (!fileInput.files.length) {
-    status.textContent = 'Choose a photo first.';
+  if (!selectedFile) {
+    status.textContent = 'Choose a photo first (Take Photo or Choose from Library).';
     return;
   }
 
-  const file = fileInput.files[0];
   const formData = new FormData();
-  formData.append('file', file);
+  formData.append('file', selectedFile);
 
   status.textContent = 'Processing...';
   table.style.display = 'none';
@@ -409,7 +445,7 @@ async function processImage() {
     if (!resp.ok) {
       const errText = await resp.text().catch(() => '');
       console.error('Server error:', errText);
-      status.textContent = 'Error from server. Try a clearer photo or check logs.';
+      status.textContent = 'Error from server. Try a clearer photo.';
       return;
     }
 
@@ -433,9 +469,7 @@ async function processImage() {
         <td>${b.source || ''}</td>
       `;
       tbody.appendChild(tr);
-      if (b.isbn) {
-        isbnList.push(b.isbn);
-      }
+      if (b.isbn) isbnList.push(b.isbn);
     });
 
     table.style.display = 'table';
@@ -446,7 +480,7 @@ async function processImage() {
       copyBtn.style.display = 'inline-block';
       status.textContent = `Done. ${isbnList.length} ISBNs ready to copy.`;
     } else {
-      status.textContent = 'Done. No ISBNs resolved — review titles and try again.';
+      status.textContent = 'Done. No ISBNs resolved — try again with a clearer photo.';
     }
   } catch (e) {
     console.error(e);
@@ -455,7 +489,14 @@ async function processImage() {
 }
 
 function clearAll() {
-  document.getElementById('file').value = '';
+  // Reset inputs (so selecting the same photo again still triggers change)
+  const cam = document.getElementById('fileCamera');
+  const lib = document.getElementById('fileLibrary');
+  cam.value = '';
+  lib.value = '';
+
+  selectedFile = null;
+  document.getElementById('fileName').textContent = 'No photo selected.';
   document.getElementById('status').textContent = '';
   document.getElementById('resultsTable').style.display = 'none';
   document.getElementById('resultsTable').querySelector('tbody').innerHTML = '';
@@ -479,6 +520,7 @@ async function copyIsbns() {
 </body>
 </html>
     """
+
 
 
 @app.post("/api/bookshelf")
@@ -521,3 +563,4 @@ async def process_bookshelf(file: UploadFile = File(...)):
 
 # To run locally:
 # uvicorn main:app --host 0.0.0.0 --port 8000
+
