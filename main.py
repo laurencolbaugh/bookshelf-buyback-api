@@ -33,7 +33,7 @@ SPINE_SLICE_OVERLAP_PX = 40         # overlap so text near edges isn't lost
 SPINE_MIN_STRIP_WIDTH = 140         # skip too-thin strips
 
 # Build stamp (lets us confirm the phone is loading the newest HTML)
-BUILD_STAMP = "2026-02-07-D"
+BUILD_STAMP = "2026-02-07-E"
 
 
 @app.get("/check-isbns")
@@ -328,13 +328,76 @@ def normalize_ocr_text(s: str) -> str:
     return s
 
 
+COMMON_WORDS = {"the", "and", "of", "in", "on", "to", "for", "with", "a", "an"}
+
+
+def generate_query_variants(normalized: str) -> List[str]:
+    """
+    Given already-normalized OCR text, generate a few safer search variants:
+    - remove tiny junk tokens
+    - drop trailing junk
+    - merge adjacent tokens (common when words split on spines)
+    Keep this small to avoid slowing things down.
+    """
+    s = (normalized or "").strip().lower()
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return []
+
+    tokens = s.split()
+
+    # Drop short tokens that are usually junk (keep common words)
+    filtered = []
+    for t in tokens:
+        if t in COMMON_WORDS:
+            filtered.append(t)
+            continue
+        if len(t) <= 2:
+            continue
+        # Drop very common OCR junk tail tokens
+        if t in {"mm", "rn", "lll", "ii"}:
+            continue
+        filtered.append(t)
+
+    if not filtered:
+        return []
+
+    base = " ".join(filtered)
+
+    # Variant: drop last token (often junk on spines)
+    drop_last = " ".join(filtered[:-1]).strip() if len(filtered) >= 3 else ""
+
+    # Variant: merge adjacent pairs (helps "hun" + "ger" -> "hunger")
+    merged_tokens = []
+    i = 0
+    while i < len(filtered):
+        if i + 1 < len(filtered):
+            combo = filtered[i] + filtered[i + 1]
+            # Only merge when both are short-ish fragments (common split-word pattern)
+            if 3 <= len(filtered[i]) <= 5 and 3 <= len(filtered[i + 1]) <= 5:
+                merged_tokens.append(combo)
+                i += 2
+                continue
+        merged_tokens.append(filtered[i])
+        i += 1
+    merged = " ".join(merged_tokens)
+
+    variants = []
+    for v in (base, drop_last, merged):
+        v = (v or "").strip()
+        if v and v not in variants:
+            variants.append(v)
+
+    return variants[:3]
+
+
 def openlibrary_lookup(query: str, debug_log: Optional[List[Dict]] = None) -> Optional[Dict]:
     """
     OpenLibrary lookup with multiple search strategies:
     - title+author (structured)
     - title-only
     - q= general
-    If debug_log is provided, append attempts and top hits.
+    Plus: we try a few query variants to survive messy OCR.
     """
     q = normalize_ocr_text(query)
     if not q:
@@ -342,106 +405,115 @@ def openlibrary_lookup(query: str, debug_log: Optional[List[Dict]] = None) -> Op
             debug_log.append({"stage": "normalize", "raw": _short(query), "normalized": ""})
         return None
 
+    variants = generate_query_variants(q)
+
     if debug_log is not None:
         debug_log.append({"stage": "normalize", "raw": _short(query), "normalized": _short(q)})
-
-    tokens = q.split()
-    author_guess = ""
-    title_guess = q
-
-    if tokens and tokens[0] in {"collins"}:
-        author_guess = tokens[0]
-        title_guess = " ".join(tokens[1:]).strip()
-
-    attempts = []
-    if author_guess and title_guess:
-        attempts.append(("structured", {"title": title_guess, "author": author_guess, "limit": 10}))
-    if title_guess:
-        attempts.append(("title_only", {"title": title_guess, "limit": 10}))
-    attempts.append(("q", {"q": q, "limit": 10}))
+        debug_log.append({"stage": "variants", "variants": variants})
 
     best = None
     best_score = -1
 
-    for mode, params in attempts:
-        try:
-            resp = requests.get(
-                "https://openlibrary.org/search.json",
-                params=params,
-                timeout=OPENLIB_TIMEOUT,
-            )
-        except Exception as e:
-            logging.error("OpenLibrary request failed (%s): %s", mode, e)
+    for qv in variants:
+        tokens = qv.split()
+        author_guess = ""
+        title_guess = qv
+
+        # Very conservative author guess (only when first token is a known surname we’ve seen)
+        if tokens and tokens[0] in {"collins"} and len(tokens) >= 3:
+            author_guess = tokens[0]
+            title_guess = " ".join(tokens[1:]).strip()
+
+        attempts = []
+        if author_guess and title_guess:
+            attempts.append(("structured", {"title": title_guess, "author": author_guess, "limit": 10}))
+        if title_guess:
+            attempts.append(("title_only", {"title": title_guess, "limit": 10}))
+        attempts.append(("q", {"q": qv, "limit": 10}))
+
+        for mode, params in attempts:
+            try:
+                resp = requests.get(
+                    "https://openlibrary.org/search.json",
+                    params=params,
+                    timeout=OPENLIB_TIMEOUT,
+                )
+            except Exception as e:
+                logging.error("OpenLibrary request failed (%s): %s", mode, e)
+                if debug_log is not None:
+                    debug_log.append({"stage": "openlibrary", "mode": mode, "params": params, "error": str(e)})
+                continue
+
+            if resp.status_code != 200:
+                logging.error("OpenLibrary bad status (%s): %s", mode, resp.status_code)
+                if debug_log is not None:
+                    debug_log.append({"stage": "openlibrary", "mode": mode, "params": params, "status": resp.status_code})
+                continue
+
+            data = resp.json()
+            docs = data.get("docs") or []
+
             if debug_log is not None:
-                debug_log.append({"stage": "openlibrary", "mode": mode, "params": params, "error": str(e)})
-            continue
-
-        if resp.status_code != 200:
-            logging.error("OpenLibrary bad status (%s): %s", mode, resp.status_code)
-            if debug_log is not None:
-                debug_log.append({"stage": "openlibrary", "mode": mode, "params": params, "status": resp.status_code})
-            continue
-
-        data = resp.json()
-        docs = data.get("docs") or []
-
-        if debug_log is not None:
-            top_docs = []
-            for d in docs[:3]:
-                isbns = d.get("isbn") or []
-                top_docs.append({
-                    "title": _short(d.get("title") or "", 90),
-                    "author": _short(((d.get("author_name") or [""])[0] or ""), 60),
-                    "has_isbn": bool(isbns),
-                    "isbn_sample": (isbns[0] if isbns else ""),
+                top_docs = []
+                for d in docs[:3]:
+                    isbns = d.get("isbn") or []
+                    top_docs.append({
+                        "title": _short(d.get("title") or "", 90),
+                        "author": _short(((d.get("author_name") or [""])[0] or ""), 60),
+                        "has_isbn": bool(isbns),
+                        "isbn_sample": (isbns[0] if isbns else ""),
+                    })
+                debug_log.append({
+                    "stage": "openlibrary",
+                    "mode": mode,
+                    "params": params,
+                    "returned_docs": len(docs),
+                    "top_docs": top_docs,
                 })
-            debug_log.append({
-                "stage": "openlibrary",
-                "mode": mode,
-                "params": params,
-                "returned_docs": len(docs),
-                "top_docs": top_docs,
-            })
 
-        if not docs:
-            continue
-
-        q_words = set(re.findall(r"[a-z0-9]+", q))
-
-        for d in docs:
-            isbns = d.get("isbn") or []
-            if not isbns:
+            if not docs:
                 continue
 
-            title = (d.get("title") or "").strip()
-            authors = d.get("author_name") or []
-            author = authors[0].strip() if authors else ""
+            q_words = set(re.findall(r"[a-z0-9]+", qv))
 
-            chosen_isbn = None
-            for raw_isbn in isbns:
-                norm = normalize_isbn(raw_isbn)
-                if norm:
-                    chosen_isbn = norm
-                    break
-            if not chosen_isbn:
-                continue
+            for d in docs:
+                isbns = d.get("isbn") or []
+                if not isbns:
+                    continue
 
-            t_words = set(re.findall(r"[a-z0-9]+", (title or "").lower()))
-            a_words = set(re.findall(r"[a-z0-9]+", (author or "").lower()))
-            score = len(q_words & t_words) + (1 if ("collins" in q_words and "collins" in a_words) else 0)
+                title = (d.get("title") or "").strip()
+                authors = d.get("author_name") or []
+                author = authors[0].strip() if authors else ""
 
-            if score > best_score:
-                best_score = score
-                best = {
-                    "title": title,
-                    "author": author,
-                    "isbn13": chosen_isbn,
-                    "source": "openlibrary",
-                    "match_score": score,
-                }
+                chosen_isbn = None
+                for raw_isbn in isbns:
+                    norm = normalize_isbn(raw_isbn)
+                    if norm:
+                        chosen_isbn = norm
+                        break
+                if not chosen_isbn:
+                    continue
 
-        # stop early if structured got something decent
-        if best and best_score >= 2 and mode == "structured":
+                t_words = set(re.findall(r"[a-z0-9]+", (title or "").lower()))
+                a_words = set(re.findall(r"[a-z0-9]+", (author or "").lower()))
+                score = len(q_words & t_words) + (1 if ("collins" in q_words and "collins" in a_words) else 0)
+
+                if score > best_score:
+                    best_score = score
+                    best = {
+                        "title": title,
+                        "author": author,
+                        "isbn13": chosen_isbn,
+                        "source": "openlibrary",
+                        "match_score": score,
+                    }
+
+            # stop early if structured got something decent
+            if best and best_score >= 2 and mode == "structured":
+                break
+
+        # If any variant produces a decent match, stop trying more variants
+        if best and best_score >= 2:
             break
 
     return best
@@ -458,15 +530,16 @@ def resolve_candidate(candidate: Dict, debug_log: Optional[List[Dict]] = None) -
         return {
             "title": ol["title"],
             "author": ol.get("author", ""),
-            "isbn": ol.get("isbn13", ""),
+            "isbn13": ol.get("isbn13", ""),
             "source": "openlibrary",
+            "match_score": ol.get("match_score", 0),
             "confidence": round(blended, 2),
         }
 
     return {
         "title": query,
         "author": "",
-        "isbn": "",
+        "isbn13": "",
         "source": "unmatched",
         "confidence": round(candidate["ocr_conf"] / 200.0, 2),
     }
@@ -656,12 +729,10 @@ async function processImage() {{
       isbnBox.style.display = 'block';
       copyBtn.style.display = 'inline-block';
       const elapsed = (meta && meta.elapsed_s != null) ? (" (elapsed " + meta.elapsed_s + "s)") : "";
-status.textContent = "Done. " + isbnList.length + " ISBNs ready to copy. (build 2026-02-07-D)" + elapsed;
-
+      status.textContent = "Done. " + isbnList.length + " ISBNs ready to copy. (build {BUILD_STAMP})" + elapsed;
     }} else {{
-     const elapsed = (meta && meta.elapsed_s != null) ? (" (elapsed " + meta.elapsed_s + "s)") : "";
-status.textContent = "Done. No ISBNs resolved — try again with a clearer photo." + elapsed;
-
+      const elapsed = (meta && meta.elapsed_s != null) ? (" (elapsed " + meta.elapsed_s + "s)") : "";
+      status.textContent = "Done. No ISBNs resolved — try again with a clearer photo." + elapsed;
     }}
   }} catch (e) {{
     if (e.name === 'AbortError') {{
@@ -784,7 +855,7 @@ async def process_bookshelf(
                 "position": idx,
                 "title": resolved["title"],
                 "author": resolved.get("author", ""),
-                "isbn": resolved.get("isbn", ""),
+                "isbn": resolved.get("isbn13", ""),
                 "confidence": resolved.get("confidence", 0.0),
                 "source": resolved.get("source", "unknown"),
             }
@@ -804,4 +875,3 @@ async def process_bookshelf(
 
 # To run locally:
 # uvicorn main:app --host 0.0.0.0 --port 8000
-
