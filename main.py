@@ -350,7 +350,8 @@ def index():
   <h1>Bookshelf → ThriftBooks ISBN Helper</h1>
   <p>Upload a clear shelf photo. I’ll OCR the spines, resolve against book data, and give you a clean ISBN column to paste into ThriftBooks buyback.</p>
 
-  <input id="file" type="file" accept="image/*" capture="environment" />
+  <!-- FIX: removed capture="environment" so iPhone offers Photo Library -->
+  <input id="file" type="file" accept="image/*" />
   <br/>
   <button class="primary" onclick="processImage()">Process Photo</button>
   <button class="secondary" onclick="clearAll()">Clear</button>
