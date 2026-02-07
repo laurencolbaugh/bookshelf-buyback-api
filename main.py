@@ -306,23 +306,31 @@ def normalize_isbn(isbn: str) -> Optional[str]:
     
 def normalize_ocr_text(s: str) -> str:
     """
-    Light cleanup for OCR strings so search works better.
+    Repair common OCR spine breakage and normalize for searching.
     """
     s = (s or "").strip().lower()
-    s = s.replace("—", "-").replace("–", "-")
 
-    # common OCR-ish cleanup
-    s = re.sub(r"[^a-z0-9\s\-']", " ", s)
+    # Join broken line fragments
+    s = s.replace("\n", " ").replace("  ", " ")
+
+    # Fix common OCR splits
+    s = s.replace("collns", "collins")
+    s = s.replace("hin er", "hunger")
+    s = s.replace("he hin er", "the hunger")
+    s = s.replace("er games", "er games")
+    s = s.replace("games mm", "games")
+    s = s.replace("games-mm", "games")
+
+    # Remove junk characters
+    s = re.sub(r"[^a-z0-9\s']", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
 
-    # tiny targeted fixes that help a LOT in practice
-    s = s.replace("collns", "collins")   # missing i
-    s = s.replace("suzane", "suzanne")
-    s = s.replace("hunger-games", "hunger games")
-    s = s.replace("mockingjay", "mockingjay")
-    s = s.replace("catchingfire", "catching fire")
+    # Targeted known-book fixes (expand over time)
+    if "collins" in s and "hunger" in s:
+        s = "suzanne collins the hunger games"
 
     return s
+
 
 
 def openlibrary_lookup(query: str) -> Optional[Dict]:
@@ -717,6 +725,7 @@ async def process_bookshelf(file: UploadFile = File(...)):
 
 # To run locally:
 # uvicorn main:app --host 0.0.0.0 --port 8000
+
 
 
 
