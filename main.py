@@ -75,9 +75,8 @@ def extract_ocr_lines(image: Image.Image) -> List[Dict]:
 
             # Preprocess for better text clarity
             img = rotated.convert("L")  # grayscale
-            img = ImageEnhance.Contrast(img).enhance(2.0)
-            img = img.filter(ImageFilter.SHARPEN)
-            img = img.filter(ImageFilter.MedianFilter(size=3))
+            img = ImageEnhance.Contrast(img).enhance(1.5)
+
 
             # timeout prevents "infinite" OCR on hard images
             data = pytesseract.image_to_data(
@@ -575,3 +574,4 @@ async def process_bookshelf(file: UploadFile = File(...)):
 
 # To run locally:
 # uvicorn main:app --host 0.0.0.0 --port 8000
+
