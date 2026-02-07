@@ -29,6 +29,9 @@ MAX_CANDIDATES = 18                 # Cap how many candidate lines we try to res
 OPENLIB_TIMEOUT = 4                 # Keep OpenLibrary fast; failing fast > hanging
 TOTAL_SOFT_BUDGET_SECONDS = 25      # If we're over budget, stop resolving more candidates
 
+# Build stamp (lets us confirm the phone is loading the newest HTML)
+BUILD_STAMP = "2026-02-07-B"
+
 
 @app.get("/check-isbns")
 def check_isbns():
@@ -304,10 +307,12 @@ def resolve_candidate(candidate: Dict) -> Dict:
 
 
 # ---------- UI ----------
+# IMPORTANT CHANGE:
+# Return HTML with NO-CACHE headers so iPhone Safari can’t keep serving an old copy of the page.
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 def index():
-    return """
+    html = f"""
 <!doctype html>
 <html lang="en">
 <head>
@@ -315,26 +320,27 @@ def index():
   <title>Bookshelf → ISBN Helper</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif; padding: 16px; background:#faf7f2; color:#222; }
-    h1 { font-size: 1.3rem; margin-bottom: 0.3rem; }
-    p { font-size: 0.9rem; margin-top: 0; margin-bottom: 0.8rem; }
-    button { padding: 10px 14px; border: none; border-radius: 8px; cursor: pointer; font-size: 0.95rem; }
-    button.primary { background: #4b6b5c; color: #fff; }
-    button.secondary { background: #e6e2db; color: #333; margin-left: 8px; }
-    button.ghost { background: #fff; color:#333; border:1px solid #d8d2c8; }
-    .row { display:flex; gap:10px; flex-wrap:wrap; margin: 10px 0 12px; }
-    .row button { flex: 1 1 160px; }
-    table { border-collapse: collapse; width: 100%; font-size: 0.8rem; margin-top: 12px; }
-    th, td { border: 1px solid #ddd; padding: 6px; text-align: left; }
-    th { background: #f1ece4; }
-    #status { font-size: 0.85rem; margin-top: 8px; color:#555; white-space: pre-line; }
-    #isbnBox { width: 100%; margin-top: 8px; font-size: 0.8rem; padding:8px; box-sizing:border-box; }
-    #fileName { font-size: 0.85rem; color:#333; margin-top: 6px; }
-    .muted { color:#666; font-size:0.85rem; }
+    body {{ font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif; padding: 16px; background:#faf7f2; color:#222; }}
+    h1 {{ font-size: 1.3rem; margin-bottom: 0.3rem; }}
+    p {{ font-size: 0.9rem; margin-top: 0; margin-bottom: 0.8rem; }}
+    button {{ padding: 10px 14px; border: none; border-radius: 8px; cursor: pointer; font-size: 0.95rem; }}
+    button.primary {{ background: #4b6b5c; color: #fff; }}
+    button.secondary {{ background: #e6e2db; color: #333; margin-left: 8px; }}
+    button.ghost {{ background: #fff; color:#333; border:1px solid #d8d2c8; }}
+    .row {{ display:flex; gap:10px; flex-wrap:wrap; margin: 10px 0 12px; }}
+    .row button {{ flex: 1 1 160px; }}
+    table {{ border-collapse: collapse; width: 100%; font-size: 0.8rem; margin-top: 12px; }}
+    th, td {{ border: 1px solid #ddd; padding: 6px; text-align: left; }}
+    th {{ background: #f1ece4; }}
+    #status {{ font-size: 0.85rem; margin-top: 8px; color:#555; white-space: pre-line; }}
+    #isbnBox {{ width: 100%; margin-top: 8px; font-size: 0.8rem; padding:8px; box-sizing:border-box; }}
+    #fileName {{ font-size: 0.85rem; color:#333; margin-top: 6px; }}
+    .muted {{ color:#666; font-size:0.85rem; }}
   </style>
 </head>
 <body>
   <h1>Bookshelf → ISBN Helper</h1>
+  <p class="muted">Build: {BUILD_STAMP}</p>
   <p>Upload a clear shelf photo. If it takes too long, the app will time out instead of hanging forever.</p>
 
   <input id="fileCamera" type="file" accept="image/*" capture="environment" style="display:none" />
@@ -375,33 +381,33 @@ def index():
 let selectedFile = null;
 let currentController = null;
 
-function setSelectedFile(file) {
+function setSelectedFile(file) {{
   selectedFile = file || null;
   const fileNameEl = document.getElementById('fileName');
   fileNameEl.textContent = selectedFile ? ("Selected: " + (selectedFile.name || "photo")) : "No photo selected.";
-}
+}}
 
-function chooseCamera() { document.getElementById('fileCamera').click(); }
-function chooseLibrary() { document.getElementById('fileLibrary').click(); }
+function chooseCamera() {{ document.getElementById('fileCamera').click(); }}
+function chooseLibrary() {{ document.getElementById('fileLibrary').click(); }}
 
-document.getElementById('fileCamera').addEventListener('change', (e) => {
+document.getElementById('fileCamera').addEventListener('change', (e) => {{
   setSelectedFile(e.target.files && e.target.files[0]);
-});
-document.getElementById('fileLibrary').addEventListener('change', (e) => {
+}});
+document.getElementById('fileLibrary').addEventListener('change', (e) => {{
   setSelectedFile(e.target.files && e.target.files[0]);
-});
+}});
 
-async function processImage() {
+async function processImage() {{
   const status = document.getElementById('status');
   const table = document.getElementById('resultsTable');
   const tbody = table.querySelector('tbody');
   const isbnBox = document.getElementById('isbnBox');
   const copyBtn = document.getElementById('copyBtn');
 
-  if (!selectedFile) {
+  if (!selectedFile) {{
     status.textContent = 'Choose a photo first.';
     return;
-  }
+  }}
 
   // Cancel any prior request
   if (currentController) currentController.abort();
@@ -410,7 +416,7 @@ async function processImage() {
   const formData = new FormData();
   formData.append('file', selectedFile);
 
-  status.textContent = 'Processing... (will time out if it takes too long)';
+  status.textContent = 'Processing... (will time out if it takes too long) — build {BUILD_STAMP}';
   table.style.display = 'none';
   tbody.innerHTML = '';
   isbnBox.style.display = 'none';
@@ -421,66 +427,66 @@ async function processImage() {
   const timeoutMs = 35000;
   const timeoutId = setTimeout(() => currentController.abort(), timeoutMs);
 
-  try {
-    const resp = await fetch('/api/bookshelf', {
+  try {{
+    const resp = await fetch('/api/bookshelf', {{
       method: 'POST',
       body: formData,
       signal: currentController.signal
-    });
+    }});
 
-    if (!resp.ok) {
+    if (!resp.ok) {{
       const errText = await resp.text().catch(() => '');
       console.error('Server error:', errText);
       status.textContent = 'Server returned an error. Try a closer / clearer photo.';
       return;
-    }
+    }}
 
     const data = await resp.json();
     const books = data.books || [];
 
-    if (!books.length) {
+    if (!books.length) {{
       status.textContent = 'No candidates detected. Try a closer or clearer shot.';
       return;
-    }
+    }}
 
     let isbnList = [];
-    books.forEach((b, idx) => {
+    books.forEach((b, idx) => {{
       const tr = document.createElement('tr');
       tr.innerHTML = `
-        <td>${idx + 1}</td>
-        <td>${(b.title || '').replace(/</g,'&lt;')}</td>
-        <td>${(b.author || '').replace(/</g,'&lt;')}</td>
-        <td>${b.isbn || ''}</td>
-        <td>${(b.confidence != null) ? (b.confidence * 100).toFixed(0) + '%' : ''}</td>
-        <td>${b.source || ''}</td>
+        <td>${{idx + 1}}</td>
+        <td>${{(b.title || '').replace(/</g,'&lt;')}}</td>
+        <td>${{(b.author || '').replace(/</g,'&lt;')}}</td>
+        <td>${{b.isbn || ''}}</td>
+        <td>${{(b.confidence != null) ? (b.confidence * 100).toFixed(0) + '%' : ''}}</td>
+        <td>${{b.source || ''}}</td>
       `;
       tbody.appendChild(tr);
       if (b.isbn) isbnList.push(b.isbn);
-    });
+    }});
 
     table.style.display = 'table';
 
-    if (isbnList.length) {
+    if (isbnList.length) {{
       isbnBox.value = isbnList.join('\\n');
       isbnBox.style.display = 'block';
       copyBtn.style.display = 'inline-block';
-      status.textContent = `Done. ${isbnList.length} ISBNs ready to copy.`;
-    } else {
+      status.textContent = `Done. ${{isbnList.length}} ISBNs ready to copy. (build {BUILD_STAMP})`;
+    }} else {{
       status.textContent = 'Done. No ISBNs resolved — try again with a clearer photo.';
-    }
-  } catch (e) {
-    if (e.name === 'AbortError') {
+    }}
+  }} catch (e) {{
+    if (e.name === 'AbortError') {{
       status.textContent = 'Timed out. Try a closer photo, or crop to fewer books per image.';
-    } else {
+    }} else {{
       console.error(e);
       status.textContent = 'Unexpected error. Try again.';
-    }
-  } finally {
+    }}
+  }} finally {{
     clearTimeout(timeoutId);
-  }
-}
+  }}
+}}
 
-function clearAll() {
+function clearAll() {{
   document.getElementById('fileCamera').value = '';
   document.getElementById('fileLibrary').value = '';
   selectedFile = null;
@@ -492,23 +498,33 @@ function clearAll() {
   document.getElementById('isbnBox').value = '';
   document.getElementById('copyBtn').style.display = 'none';
   if (currentController) currentController.abort();
-}
+}}
 
-async function copyIsbns() {
+async function copyIsbns() {{
   const isbnBox = document.getElementById('isbnBox');
   isbnBox.select();
   isbnBox.setSelectionRange(0, 99999);
-  try {
+  try {{
     await navigator.clipboard.writeText(isbnBox.value);
     document.getElementById('status').textContent = 'ISBNs copied to clipboard.';
-  } catch {
+  }} catch {{
     document.getElementById('status').textContent = 'Select + copy manually (clipboard blocked).';
-  }
-}
+  }}
+}}
 </script>
 </body>
 </html>
     """
+
+    # No-cache headers: prevents iPhone Safari from reusing an old copy of "/"
+    return HTMLResponse(
+        content=html,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 # ---------- API ENDPOINT ----------
@@ -556,3 +572,6 @@ async def process_bookshelf(file: UploadFile = File(...)):
         )
 
     return {"books": books, "meta": {"candidates_used": len(books), "elapsed_s": round(time.time() - started, 2)}}
+
+# To run locally:
+# uvicorn main:app --host 0.0.0.0 --port 8000
