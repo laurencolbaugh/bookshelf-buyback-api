@@ -34,7 +34,7 @@ SPINE_MIN_STRIP_WIDTH = 140     # skip too-thin strips
 
 
 # Build stamp (lets us confirm the phone is loading the newest HTML)
-BUILD_STAMP = "2026-02-07-B"
+BUILD_STAMP = "2026-02-07-C"
 
 
 @app.get("/check-isbns")
@@ -725,6 +725,7 @@ async def process_bookshelf(file: UploadFile = File(...)):
 
 # To run locally:
 # uvicorn main:app --host 0.0.0.0 --port 8000
+
 
 
 
