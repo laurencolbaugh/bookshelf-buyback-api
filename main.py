@@ -655,11 +655,13 @@ async function processImage() {{
       isbnBox.value = isbnList.join('\\n');
       isbnBox.style.display = 'block';
       copyBtn.style.display = 'inline-block';
-      const elapsed = meta && meta.elapsed_s != null ? ` (elapsed {meta.elapsed_s}s)` : '';
-      status.textContent = `Done. ${{isbnList.length}} ISBNs ready to copy. (build {BUILD_STAMP})${{elapsed}}`;
+      const elapsed = (meta && meta.elapsed_s != null) ? (" (elapsed " + meta.elapsed_s + "s)") : "";
+status.textContent = "Done. " + isbnList.length + " ISBNs ready to copy. (build 2026-02-07-D)" + elapsed;
+
     }} else {{
-      const elapsed = meta && meta.elapsed_s != null ? ` (elapsed {meta.elapsed_s}s)` : '';
-      status.textContent = 'Done. No ISBNs resolved — try again with a clearer photo.' + elapsed;
+     const elapsed = (meta && meta.elapsed_s != null) ? (" (elapsed " + meta.elapsed_s + "s)") : "";
+status.textContent = "Done. No ISBNs resolved — try again with a clearer photo." + elapsed;
+
     }}
   }} catch (e) {{
     if (e.name === 'AbortError') {{
@@ -802,3 +804,4 @@ async def process_bookshelf(
 
 # To run locally:
 # uvicorn main:app --host 0.0.0.0 --port 8000
+
