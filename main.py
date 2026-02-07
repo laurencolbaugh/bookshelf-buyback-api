@@ -1,12 +1,13 @@
 import io
 import re
+import time
 import logging
 from typing import List, Dict, Optional
 
 import requests
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse, HTMLResponse
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 import pytesseract
 from pytesseract import TesseractNotFoundError
 
@@ -15,7 +16,18 @@ pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="Bookshelf OCR → ThriftBooks Helper")
+app = FastAPI(title="Bookshelf OCR → ISBN Helper")
+
+# ---------------------------
+# Performance / reliability knobs
+# ---------------------------
+MAX_IMAGE_LONG_EDGE = 1600          # Downscale big iPhone photos before OCR
+OCR_ANGLES = (0, 90)                # Fewer rotations = faster; 0 + 90 catches most spines
+OCR_TIMEOUT_SECONDS = 12            # Hard timeout per OCR call
+MIN_OCR_CONF = 25                   # Filter low-confidence junk harder
+MAX_CANDIDATES = 18                 # Cap how many candidate lines we try to resolve
+OPENLIB_TIMEOUT = 4                 # Keep OpenLibrary fast; failing fast > hanging
+TOTAL_SOFT_BUDGET_SECONDS = 25      # If we're over budget, stop resolving more candidates
 
 
 @app.get("/check-isbns")
@@ -24,6 +36,25 @@ def check_isbns():
         "status": "ok",
         "message": "Bookshelf ISBN helper is running. Use '/' to upload a photo or '/api/bookshelf' for API access.",
     }
+
+
+# ---------- IMAGE PREP ----------
+
+def downscale_for_ocr(image: Image.Image) -> Image.Image:
+    """
+    Downscale large images to keep OCR fast and avoid Render timeouts.
+    """
+    image = ImageOps.exif_transpose(image)  # respect iPhone orientation metadata
+    w, h = image.size
+    long_edge = max(w, h)
+    if long_edge <= MAX_IMAGE_LONG_EDGE:
+        return image
+
+    scale = MAX_IMAGE_LONG_EDGE / float(long_edge)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    logging.info("Downscaling image from %sx%s to %sx%s for OCR", w, h, new_w, new_h)
+    return image.resize((new_w, new_h), Image.LANCZOS)
 
 
 # ---------- OCR HELPERS ----------
@@ -35,7 +66,7 @@ def extract_ocr_lines(image: Image.Image) -> List[Dict]:
     """
     all_lines: List[Dict] = []
 
-    for angle in (0, 90, 270):
+    for angle in OCR_ANGLES:
         try:
             rotated = image.rotate(angle, expand=True)
 
@@ -45,18 +76,24 @@ def extract_ocr_lines(image: Image.Image) -> List[Dict]:
             img = img.filter(ImageFilter.SHARPEN)
             img = img.filter(ImageFilter.MedianFilter(size=3))
 
+            # timeout prevents "infinite" OCR on hard images
             data = pytesseract.image_to_data(
                 img,
                 output_type=pytesseract.Output.DICT,
                 config="--psm 6 --oem 3",
+                timeout=OCR_TIMEOUT_SECONDS,
             )
         except TesseractNotFoundError:
             raise RuntimeError("Tesseract OCR not found in environment.")
+        except RuntimeError as e:
+            # pytesseract raises RuntimeError on timeout
+            logging.error("OCR timeout/failure at angle %s: %s", angle, e)
+            continue
         except Exception as e:
             logging.error("OCR failure at angle %s: %s", angle, e)
             continue
 
-        n = len(data["text"])
+        n = len(data.get("text", []))
         lines: Dict[tuple, Dict] = {}
 
         for i in range(n):
@@ -90,40 +127,27 @@ def extract_ocr_lines(image: Image.Image) -> List[Dict]:
             full_text = " ".join(content["texts"]).strip()
             if len(full_text) < 3:
                 continue
-            avg_conf = sum(content["confs"]) / len(content["confs"])
-            all_lines.append(
-                {
-                    "text": full_text,
-                    "conf": avg_conf,
-                    "angle": angle,
-                }
-            )
+            avg_conf = sum(content["confs"]) / max(1, len(content["confs"]))
+            all_lines.append({"text": full_text, "conf": avg_conf, "angle": angle})
 
     if not all_lines:
-        try:
-            raw = pytesseract.image_to_string(image)
-            logging.info("[DEBUG] Fallback OCR sample: %s", raw[:200])
-        except Exception:
-            pass
         return []
 
     # Deduplicate & keep only reasonable-confidence lines
     deduped: List[Dict] = []
     seen = set()
     for entry in sorted(all_lines, key=lambda x: x["conf"], reverse=True):
-        text = entry["text"].strip()
-        if entry["conf"] < 15:  # toss ultra-low confidence
+        if entry["conf"] < MIN_OCR_CONF:
             continue
+        text = entry["text"].strip()
         key = re.sub(r"\s+", " ", text.lower())
         if key in seen:
             continue
         seen.add(key)
         deduped.append({"text": text, "conf": entry["conf"]})
 
-    if len(deduped) <= 5:
-        logging.info("[DEBUG] OCR lines after filtering: %s", [d["text"] for d in deduped])
-
-    return deduped
+    # Keep only top N lines to avoid explosion
+    return deduped[: max(30, MAX_CANDIDATES * 2)]
 
 
 # ---------- CANDIDATE GENERATION ----------
@@ -135,17 +159,14 @@ NOISE_TERMS = [
 
 
 def clean_line_to_titleish(text: str) -> Optional[str]:
-    """
-    Take a noisy OCR line and keep only plausible word tokens.
-    Returns cleaned string or None if it's junk.
-    """
     tokens = re.findall(r"[A-Za-z][A-Za-z'\-]+", text)
-
     if len(tokens) < 2:
-        return None  # need at least two tokens to be interesting
+        return None
 
     filtered = []
     for t in tokens:
+        if any(ch.isdigit() for ch in t):
+            continue
         if len(t) <= 2 and t.isupper():
             continue
         filtered.append(t)
@@ -166,34 +187,21 @@ def clean_line_to_titleish(text: str) -> Optional[str]:
 
 
 def generate_candidates(ocr_lines: List[Dict]) -> List[Dict]:
-    """
-    Turn OCR lines into cleaned candidate strings for lookup.
-    """
     candidates: List[Dict] = []
-
     for line in ocr_lines:
         cleaned = clean_line_to_titleish(line["text"])
         if not cleaned:
             continue
+        candidates.append({"raw": cleaned, "ocr_conf": line["conf"]})
 
-        candidates.append(
-            {
-                "raw": cleaned,
-                "ocr_conf": line["conf"],
-            }
-        )
-
-    logging.info("[DEBUG] Candidates: %s", [c["raw"] for c in candidates])
-
-    return candidates
+    # Sort by OCR confidence, then cap count
+    candidates.sort(key=lambda c: c["ocr_conf"], reverse=True)
+    return candidates[:MAX_CANDIDATES]
 
 
 # ---------- LOOKUP HELPERS ----------
 
 def normalize_isbn(isbn: str) -> Optional[str]:
-    """
-    Return 13-digit, no-hyphen ISBN if possible.
-    """
     if not isbn:
         return None
     digits = re.sub(r"\D", "", isbn)
@@ -210,22 +218,12 @@ def normalize_isbn(isbn: str) -> Optional[str]:
     return None
 
 
-def thriftbooks_lookup_stub(query: str) -> Optional[Dict]:
-    """
-    Placeholder: ThriftBooks-first lookup would go here.
-    """
-    return None
-
-
 def openlibrary_lookup(query: str) -> Optional[Dict]:
-    """
-    Fallback lookup via OpenLibrary.
-    """
     try:
         resp = requests.get(
             "https://openlibrary.org/search.json",
             params={"q": query, "limit": 5},
-            timeout=6,
+            timeout=OPENLIB_TIMEOUT,
         )
     except Exception as e:
         logging.error("OpenLibrary request failed: %s", e)
@@ -242,6 +240,8 @@ def openlibrary_lookup(query: str) -> Optional[Dict]:
 
     best = None
     best_score = -1
+
+    q_words = set(re.findall(r"[A-Za-z0-9]+", query.lower()))
 
     for d in docs:
         isbns = d.get("isbn") or []
@@ -261,10 +261,8 @@ def openlibrary_lookup(query: str) -> Optional[Dict]:
         if not chosen_isbn:
             continue
 
-        q_words = set(re.findall(r"[A-Za-z0-9]+", query.lower()))
         t_words = set(re.findall(r"[A-Za-z0-9]+", title.lower()))
-        overlap = len(q_words & t_words)
-        score = overlap
+        score = len(q_words & t_words)
 
         if score > best_score:
             best_score = score
@@ -280,31 +278,19 @@ def openlibrary_lookup(query: str) -> Optional[Dict]:
 
 
 def resolve_candidate(candidate: Dict) -> Dict:
-    """
-    Try ThriftBooks (stub), then OpenLibrary; otherwise return unmatched.
-    """
     query = candidate["raw"]
-
-    tb = thriftbooks_lookup_stub(query)
-    if tb:
-        return {
-            "title": tb["title"],
-            "author": tb.get("author", ""),
-            "isbn": tb.get("isbn13") or "",
-            "source": "thriftbooks",
-            "confidence": min(0.99, 0.6 + candidate["ocr_conf"] / 100 * 0.4),
-        }
 
     ol = openlibrary_lookup(query)
     if ol:
+        # Conservative confidence blending
         ocr_conf = max(0.0, min(candidate["ocr_conf"], 95.0)) / 100.0
         match_norm = 0.3 + 0.1 * (ol.get("match_score", 0))
-        blended = max(0.3, min(0.98, 0.4 * ocr_conf + 0.6 * (match_norm / 3.0)))
+        blended = max(0.25, min(0.95, 0.45 * ocr_conf + 0.55 * (match_norm / 3.0)))
         return {
             "title": ol["title"],
             "author": ol.get("author", ""),
             "isbn": ol.get("isbn13", ""),
-            "source": ol.get("source", "openlibrary"),
+            "source": "openlibrary",
             "confidence": round(blended, 2),
         }
 
@@ -317,19 +303,16 @@ def resolve_candidate(candidate: Dict) -> Dict:
     }
 
 
-# ---------- API ENDPOINTS ----------
+# ---------- UI ----------
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    """
-    Minimal phone-friendly UI: upload → table → copy ISBNs.
-    """
     return """
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Bookshelf → ThriftBooks ISBN Helper</title>
+  <title>Bookshelf → ISBN Helper</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     body { font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif; padding: 16px; background:#faf7f2; color:#222; }
@@ -351,10 +334,9 @@ def index():
   </style>
 </head>
 <body>
-  <h1>Bookshelf → ThriftBooks ISBN Helper</h1>
-  <p>Upload a clear shelf photo. I’ll OCR the spines, resolve against book data, and give you a clean ISBN column.</p>
+  <h1>Bookshelf → ISBN Helper</h1>
+  <p>Upload a clear shelf photo. If it takes too long, the app will time out instead of hanging forever.</p>
 
-  <!-- Hidden inputs: one forces camera, one allows library -->
   <input id="fileCamera" type="file" accept="image/*" capture="environment" style="display:none" />
   <input id="fileLibrary" type="file" accept="image/*" style="display:none" />
 
@@ -391,6 +373,7 @@ def index():
 
 <script>
 let selectedFile = null;
+let currentController = null;
 
 function setSelectedFile(file) {
   selectedFile = file || null;
@@ -398,18 +381,12 @@ function setSelectedFile(file) {
   fileNameEl.textContent = selectedFile ? ("Selected: " + (selectedFile.name || "photo")) : "No photo selected.";
 }
 
-function chooseCamera() {
-  document.getElementById('fileCamera').click();
-}
-
-function chooseLibrary() {
-  document.getElementById('fileLibrary').click();
-}
+function chooseCamera() { document.getElementById('fileCamera').click(); }
+function chooseLibrary() { document.getElementById('fileLibrary').click(); }
 
 document.getElementById('fileCamera').addEventListener('change', (e) => {
   setSelectedFile(e.target.files && e.target.files[0]);
 });
-
 document.getElementById('fileLibrary').addEventListener('change', (e) => {
   setSelectedFile(e.target.files && e.target.files[0]);
 });
@@ -422,30 +399,39 @@ async function processImage() {
   const copyBtn = document.getElementById('copyBtn');
 
   if (!selectedFile) {
-    status.textContent = 'Choose a photo first (Take Photo or Choose from Library).';
+    status.textContent = 'Choose a photo first.';
     return;
   }
+
+  // Cancel any prior request
+  if (currentController) currentController.abort();
+  currentController = new AbortController();
 
   const formData = new FormData();
   formData.append('file', selectedFile);
 
-  status.textContent = 'Processing...';
+  status.textContent = 'Processing... (will time out if it takes too long)';
   table.style.display = 'none';
   tbody.innerHTML = '';
   isbnBox.style.display = 'none';
   isbnBox.value = '';
   copyBtn.style.display = 'none';
 
+  // Hard client timeout so UI never hangs forever
+  const timeoutMs = 35000;
+  const timeoutId = setTimeout(() => currentController.abort(), timeoutMs);
+
   try {
     const resp = await fetch('/api/bookshelf', {
       method: 'POST',
-      body: formData
+      body: formData,
+      signal: currentController.signal
     });
 
     if (!resp.ok) {
       const errText = await resp.text().catch(() => '');
       console.error('Server error:', errText);
-      status.textContent = 'Error from server. Try a clearer photo.';
+      status.textContent = 'Server returned an error. Try a closer / clearer photo.';
       return;
     }
 
@@ -483,18 +469,20 @@ async function processImage() {
       status.textContent = 'Done. No ISBNs resolved — try again with a clearer photo.';
     }
   } catch (e) {
-    console.error(e);
-    status.textContent = 'Unexpected error. Try again.';
+    if (e.name === 'AbortError') {
+      status.textContent = 'Timed out. Try a closer photo, or crop to fewer books per image.';
+    } else {
+      console.error(e);
+      status.textContent = 'Unexpected error. Try again.';
+    }
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
 function clearAll() {
-  // Reset inputs (so selecting the same photo again still triggers change)
-  const cam = document.getElementById('fileCamera');
-  const lib = document.getElementById('fileLibrary');
-  cam.value = '';
-  lib.value = '';
-
+  document.getElementById('fileCamera').value = '';
+  document.getElementById('fileLibrary').value = '';
   selectedFile = null;
   document.getElementById('fileName').textContent = 'No photo selected.';
   document.getElementById('status').textContent = '';
@@ -503,6 +491,7 @@ function clearAll() {
   document.getElementById('isbnBox').style.display = 'none';
   document.getElementById('isbnBox').value = '';
   document.getElementById('copyBtn').style.display = 'none';
+  if (currentController) currentController.abort();
 }
 
 async function copyIsbns() {
@@ -522,21 +511,23 @@ async function copyIsbns() {
     """
 
 
+# ---------- API ENDPOINT ----------
 
 @app.post("/api/bookshelf")
 async def process_bookshelf(file: UploadFile = File(...)):
     """
     Core OCR → candidate → lookup pipeline.
+    Hardened to avoid long hangs on large photos.
     """
+    started = time.time()
+
     content = await file.read()
     try:
         image = Image.open(io.BytesIO(content))
         image = image.convert("RGB")
+        image = downscale_for_ocr(image)
     except Exception:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "Unable to read image file."},
-        )
+        return JSONResponse(status_code=400, content={"error": "Unable to read image file."})
 
     try:
         ocr_lines = extract_ocr_lines(image)
@@ -547,6 +538,11 @@ async def process_bookshelf(file: UploadFile = File(...)):
 
     books = []
     for idx, cand in enumerate(candidates, start=1):
+        # Soft budget: stop doing lookups if we're taking too long
+        if time.time() - started > TOTAL_SOFT_BUDGET_SECONDS:
+            logging.warning("Stopping early due to time budget; returning partial results.")
+            break
+
         resolved = resolve_candidate(cand)
         books.append(
             {
@@ -559,8 +555,4 @@ async def process_bookshelf(file: UploadFile = File(...)):
             }
         )
 
-    return {"books": books}
-
-# To run locally:
-# uvicorn main:app --host 0.0.0.0 --port 8000
-
+    return {"books": books, "meta": {"candidates_used": len(books), "elapsed_s": round(time.time() - started, 2)}}
