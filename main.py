@@ -22,12 +22,16 @@ app = FastAPI(title="Bookshelf OCR → ISBN Helper")
 # Performance / reliability knobs
 # ---------------------------
 MAX_IMAGE_LONG_EDGE = 1600          # Downscale big iPhone photos before OCR
-OCR_ANGLES = (0, 90)                # Fewer rotations = faster; 0 + 90 catches most spines
+OCR_ANGLES = (0,)  # whole-image 90° is redundant now that slices rotate both ways
 OCR_TIMEOUT_SECONDS = 12            # Hard timeout per OCR call
 MIN_OCR_CONF = 25                   # Filter low-confidence junk harder
 MAX_CANDIDATES = 18                 # Cap how many candidate lines we try to resolve
 OPENLIB_TIMEOUT = 4                 # Keep OpenLibrary fast; failing fast > hanging
 TOTAL_SOFT_BUDGET_SECONDS = 25      # If we're over budget, stop resolving more candidates
+SPINE_SLICE_COUNT = 10          # how many vertical bands to OCR
+SPINE_SLICE_OVERLAP_PX = 40     # overlap so text near edges isn't lost
+SPINE_MIN_STRIP_WIDTH = 140     # skip too-thin strips
+
 
 # Build stamp (lets us confirm the phone is loading the newest HTML)
 BUILD_STAMP = "2026-02-07-B"
@@ -64,36 +68,29 @@ def downscale_for_ocr(image: Image.Image) -> Image.Image:
 
 def extract_ocr_lines(image: Image.Image) -> List[Dict]:
     """
-    Preprocess + multi-orientation OCR.
+    Spine-optimized OCR:
+    1) OCR full image at a couple orientations
+    2) Slice into vertical bands, rotate bands upright, OCR each band
     Returns a list of text lines with average confidence.
     """
     all_lines: List[Dict] = []
 
-    for angle in OCR_ANGLES:
+    def _run_ocr(img: Image.Image, angle_label: str) -> None:
+        """Run tesseract, collect line-level text + avg conf."""
         try:
-            rotated = image.rotate(angle, expand=True)
-
-            # Preprocess for better text clarity
-            img = rotated.convert("L")  # grayscale
-            img = ImageEnhance.Contrast(img).enhance(1.5)
-
-
-            # timeout prevents "infinite" OCR on hard images
             data = pytesseract.image_to_data(
                 img,
                 output_type=pytesseract.Output.DICT,
+                # psm 6 works for blocks, psm 7 works well for single-line spines
                 config="--psm 6 --oem 3",
                 timeout=OCR_TIMEOUT_SECONDS,
             )
-        except TesseractNotFoundError:
-            raise RuntimeError("Tesseract OCR not found in environment.")
         except RuntimeError as e:
-            # pytesseract raises RuntimeError on timeout
-            logging.error("OCR timeout/failure at angle %s: %s", angle, e)
-            continue
+            logging.error("OCR timeout/failure (%s): %s", angle_label, e)
+            return
         except Exception as e:
-            logging.error("OCR failure at angle %s: %s", angle, e)
-            continue
+            logging.error("OCR failure (%s): %s", angle_label, e)
+            return
 
         n = len(data.get("text", []))
         lines: Dict[tuple, Dict] = {}
@@ -102,7 +99,6 @@ def extract_ocr_lines(image: Image.Image) -> List[Dict]:
             raw = data["text"][i]
             if not raw:
                 continue
-
             text = raw.strip()
             if not text:
                 continue
@@ -130,7 +126,94 @@ def extract_ocr_lines(image: Image.Image) -> List[Dict]:
             if len(full_text) < 3:
                 continue
             avg_conf = sum(content["confs"]) / max(1, len(content["confs"]))
-            all_lines.append({"text": full_text, "conf": avg_conf, "angle": angle})
+            all_lines.append({"text": full_text, "conf": avg_conf, "angle": angle_label})
+
+    def _prep(img: Image.Image) -> Image.Image:
+        """Preprocess for better spine text clarity."""
+        g = img.convert("L")
+        g = ImageEnhance.Contrast(g).enhance(2.2)
+        g = g.filter(ImageFilter.SHARPEN)
+        g = g.filter(ImageFilter.MedianFilter(size=3))
+        return g
+
+    # --- Pass A: Whole-image OCR (quick)
+    for angle in OCR_ANGLES:
+        rotated = image.rotate(angle, expand=True)
+        _run_ocr(_prep(rotated), angle_label=f"whole_{angle}")
+
+    # --- Pass B: Spine slicing OCR (high value for shelves)
+    w, h = image.size
+    slice_count = max(6, int(SPINE_SLICE_COUNT))
+    base_strip_w = max(1, w // slice_count)
+
+    for i in range(slice_count):
+        left = i * base_strip_w - SPINE_SLICE_OVERLAP_PX
+        right = (i + 1) * base_strip_w + SPINE_SLICE_OVERLAP_PX
+        left = max(0, left)
+        right = min(w, right)
+
+        if (right - left) < SPINE_MIN_STRIP_WIDTH:
+            continue
+
+        strip = image.crop((left, 0, right, h))
+
+        # Rotate strip so vertical spine text becomes horizontal.
+        # Most spines read bottom-to-top in your photo -> rotate 90° CCW or CW; try both quickly.
+        for rot, label in ((90, "slice_90"), (270, "slice_270")):
+            rotated_strip = strip.rotate(rot, expand=True)
+
+            # Use a tighter page segmentation on strips: single line / single block.
+            # We run image_to_data twice with different PSMs by swapping config via temp call:
+            try:
+                img = _prep(rotated_strip)
+                data = pytesseract.image_to_data(
+                    img,
+                    output_type=pytesseract.Output.DICT,
+                    config="--psm 7 --oem 3",   # single text line
+                    timeout=OCR_TIMEOUT_SECONDS,
+                )
+            except RuntimeError as e:
+                logging.error("OCR timeout/failure (%s): %s", label, e)
+                continue
+            except Exception as e:
+                logging.error("OCR failure (%s): %s", label, e)
+                continue
+
+            n = len(data.get("text", []))
+            lines: Dict[tuple, Dict] = {}
+
+            for j in range(n):
+                raw = data["text"][j]
+                if not raw:
+                    continue
+                text = raw.strip()
+                if not text:
+                    continue
+
+                conf_str = data.get("conf", ["-1"] * n)[j]
+                try:
+                    conf = float(conf_str)
+                except (ValueError, TypeError):
+                    conf = -1.0
+                if conf < 0:
+                    continue
+
+                key = (
+                    data.get("block_num", [0] * n)[j],
+                    data.get("par_num", [0] * n)[j],
+                    data.get("line_num", [0] * n)[j],
+                )
+                if key not in lines:
+                    lines[key] = {"texts": [], "confs": []}
+                lines[key]["texts"].append(text)
+                lines[key]["confs"].append(conf)
+
+            for _, content in lines.items():
+                full_text = " ".join(content["texts"]).strip()
+                if len(full_text) < 3:
+                    continue
+                avg_conf = sum(content["confs"]) / max(1, len(content["confs"]))
+                all_lines.append({"text": full_text, "conf": avg_conf, "angle": f"{label}_band{i}"})
 
     if not all_lines:
         return []
@@ -138,6 +221,7 @@ def extract_ocr_lines(image: Image.Image) -> List[Dict]:
     # Deduplicate & keep only reasonable-confidence lines
     deduped: List[Dict] = []
     seen = set()
+
     for entry in sorted(all_lines, key=lambda x: x["conf"], reverse=True):
         if entry["conf"] < MIN_OCR_CONF:
             continue
@@ -149,7 +233,8 @@ def extract_ocr_lines(image: Image.Image) -> List[Dict]:
         deduped.append({"text": text, "conf": entry["conf"]})
 
     # Keep only top N lines to avoid explosion
-    return deduped[: max(30, MAX_CANDIDATES * 2)]
+    return deduped[: max(40, MAX_CANDIDATES * 3)]
+
 
 
 # ---------- CANDIDATE GENERATION ----------
@@ -574,4 +659,5 @@ async def process_bookshelf(file: UploadFile = File(...)):
 
 # To run locally:
 # uvicorn main:app --host 0.0.0.0 --port 8000
+
 
