@@ -21,14 +21,14 @@ app = FastAPI(title="Bookshelf OCR → ISBN Helper")
 # ---------------------------
 # Performance / reliability knobs
 # ---------------------------
-MAX_IMAGE_LONG_EDGE = 1600          # Downscale big iPhone photos before OCR
+MAX_IMAGE_LONG_EDGE = 1100          # Downscale big iPhone photos before OCR
 OCR_ANGLES = (0,)  # whole-image 90° is redundant now that slices rotate both ways
-OCR_TIMEOUT_SECONDS = 12            # Hard timeout per OCR call
+OCR_TIMEOUT_SECONDS = 6            # Hard timeout per OCR call
 MIN_OCR_CONF = 25                   # Filter low-confidence junk harder
-MAX_CANDIDATES = 18                 # Cap how many candidate lines we try to resolve
-OPENLIB_TIMEOUT = 4                 # Keep OpenLibrary fast; failing fast > hanging
+MAX_CANDIDATES = 10                 # Cap how many candidate lines we try to resolve
+OPENLIB_TIMEOUT = 2                 # Keep OpenLibrary fast; failing fast > hanging
 TOTAL_SOFT_BUDGET_SECONDS = 25      # If we're over budget, stop resolving more candidates
-SPINE_SLICE_COUNT = 10          # how many vertical bands to OCR
+SPINE_SLICE_COUNT = 6          # how many vertical bands to OCR
 SPINE_SLICE_OVERLAP_PX = 40     # overlap so text near edges isn't lost
 SPINE_MIN_STRIP_WIDTH = 140     # skip too-thin strips
 
@@ -159,7 +159,7 @@ def extract_ocr_lines(image: Image.Image) -> List[Dict]:
 
         # Rotate strip so vertical spine text becomes horizontal.
         # Most spines read bottom-to-top in your photo -> rotate 90° CCW or CW; try both quickly.
-        for rot, label in ((90, "slice_90"), (270, "slice_270")):
+        for rot, label in ((90, "slice_90"),):
             rotated_strip = strip.rotate(rot, expand=True)
 
             # Use a tighter page segmentation on strips: single line / single block.
@@ -659,5 +659,6 @@ async def process_bookshelf(file: UploadFile = File(...)):
 
 # To run locally:
 # uvicorn main:app --host 0.0.0.0 --port 8000
+
 
 
