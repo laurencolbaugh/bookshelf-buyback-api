@@ -5,7 +5,7 @@ import logging
 from typing import List, Dict, Optional
 
 import requests
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import JSONResponse, HTMLResponse
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 import pytesseract
@@ -22,19 +22,18 @@ app = FastAPI(title="Bookshelf OCR → ISBN Helper")
 # Performance / reliability knobs
 # ---------------------------
 MAX_IMAGE_LONG_EDGE = 1100          # Downscale big iPhone photos before OCR
-OCR_ANGLES = (0,)  # whole-image 90° is redundant now that slices rotate both ways
-OCR_TIMEOUT_SECONDS = 6            # Hard timeout per OCR call
+OCR_ANGLES = (0,)                   # whole-image 90° is redundant now that slices rotate
+OCR_TIMEOUT_SECONDS = 6             # Hard timeout per OCR call
 MIN_OCR_CONF = 25                   # Filter low-confidence junk harder
 MAX_CANDIDATES = 10                 # Cap how many candidate lines we try to resolve
 OPENLIB_TIMEOUT = 2                 # Keep OpenLibrary fast; failing fast > hanging
 TOTAL_SOFT_BUDGET_SECONDS = 25      # If we're over budget, stop resolving more candidates
-SPINE_SLICE_COUNT = 6          # how many vertical bands to OCR
-SPINE_SLICE_OVERLAP_PX = 40     # overlap so text near edges isn't lost
-SPINE_MIN_STRIP_WIDTH = 140     # skip too-thin strips
-
+SPINE_SLICE_COUNT = 6               # how many vertical bands to OCR
+SPINE_SLICE_OVERLAP_PX = 40         # overlap so text near edges isn't lost
+SPINE_MIN_STRIP_WIDTH = 140         # skip too-thin strips
 
 # Build stamp (lets us confirm the phone is loading the newest HTML)
-BUILD_STAMP = "2026-02-07-C"
+BUILD_STAMP = "2026-02-07-D"
 
 
 @app.get("/check-isbns")
@@ -43,6 +42,13 @@ def check_isbns():
         "status": "ok",
         "message": "Bookshelf ISBN helper is running. Use '/' to upload a photo or '/api/bookshelf' for API access.",
     }
+
+
+# ---------- SMALL HELPERS ----------
+
+def _short(s: str, n: int = 160) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= n else s[: n - 3] + "..."
 
 
 # ---------- IMAGE PREP ----------
@@ -81,7 +87,6 @@ def extract_ocr_lines(image: Image.Image) -> List[Dict]:
             data = pytesseract.image_to_data(
                 img,
                 output_type=pytesseract.Output.DICT,
-                # psm 6 works for blocks, psm 7 works well for single-line spines
                 config="--psm 6 --oem 3",
                 timeout=OCR_TIMEOUT_SECONDS,
             )
@@ -158,18 +163,15 @@ def extract_ocr_lines(image: Image.Image) -> List[Dict]:
         strip = image.crop((left, 0, right, h))
 
         # Rotate strip so vertical spine text becomes horizontal.
-        # Most spines read bottom-to-top in your photo -> rotate 90° CCW or CW; try both quickly.
         for rot, label in ((90, "slice_90"),):
             rotated_strip = strip.rotate(rot, expand=True)
 
-            # Use a tighter page segmentation on strips: single line / single block.
-            # We run image_to_data twice with different PSMs by swapping config via temp call:
             try:
                 img = _prep(rotated_strip)
                 data = pytesseract.image_to_data(
                     img,
                     output_type=pytesseract.Output.DICT,
-                    config="--psm 7 --oem 3",   # single text line
+                    config="--psm 7 --oem 3",   # single line works well for spines
                     timeout=OCR_TIMEOUT_SECONDS,
                 )
             except RuntimeError as e:
@@ -236,7 +238,6 @@ def extract_ocr_lines(image: Image.Image) -> List[Dict]:
     return deduped[: max(40, MAX_CANDIDATES * 3)]
 
 
-
 # ---------- CANDIDATE GENERATION ----------
 
 NOISE_TERMS = [
@@ -281,7 +282,6 @@ def generate_candidates(ocr_lines: List[Dict]) -> List[Dict]:
             continue
         candidates.append({"raw": cleaned, "ocr_conf": line["conf"]})
 
-    # Sort by OCR confidence, then cap count
     candidates.sort(key=lambda c: c["ocr_conf"], reverse=True)
     return candidates[:MAX_CANDIDATES]
 
@@ -303,48 +303,48 @@ def normalize_isbn(isbn: str) -> Optional[str]:
         check = (10 - (total % 10)) % 10
         return core + str(check)
     return None
-    
+
+
 def normalize_ocr_text(s: str) -> str:
     """
     Repair common OCR spine breakage and normalize for searching.
+    (Keep this conservative; debug mode will tell us what to add next.)
     """
     s = (s or "").strip().lower()
 
-    # Join broken line fragments
-    s = s.replace("\n", " ").replace("  ", " ")
+    # Join broken fragments
+    s = s.replace("\n", " ")
 
-    # Fix common OCR splits
+    # Reduce weird punctuation into spaces
+    s = s.replace("—", " ").replace("–", " ").replace("-", " ")
+
+    # Known common fixups
     s = s.replace("collns", "collins")
-    s = s.replace("hin er", "hunger")
-    s = s.replace("he hin er", "the hunger")
-    s = s.replace("er games", "er games")
-    s = s.replace("games mm", "games")
-    s = s.replace("games-mm", "games")
 
-    # Remove junk characters
+    # Remove junk chars
     s = re.sub(r"[^a-z0-9\s']", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-
-    # Targeted known-book fixes (expand over time)
-    if "collins" in s and "hunger" in s:
-        s = "suzanne collins the hunger games"
 
     return s
 
 
-
-def openlibrary_lookup(query: str) -> Optional[Dict]:
+def openlibrary_lookup(query: str, debug_log: Optional[List[Dict]] = None) -> Optional[Dict]:
     """
     OpenLibrary lookup with multiple search strategies:
-    - q= (general)
-    - title= and author= (structured, often better)
+    - title+author (structured)
+    - title-only
+    - q= general
+    If debug_log is provided, append attempts and top hits.
     """
     q = normalize_ocr_text(query)
     if not q:
+        if debug_log is not None:
+            debug_log.append({"stage": "normalize", "raw": _short(query), "normalized": ""})
         return None
 
-    # Try to split an "AUTHOR TITLE" pattern if present.
-    # Example OCR: "collins the hunger games"
+    if debug_log is not None:
+        debug_log.append({"stage": "normalize", "raw": _short(query), "normalized": _short(q)})
+
     tokens = q.split()
     author_guess = ""
     title_guess = q
@@ -354,16 +354,10 @@ def openlibrary_lookup(query: str) -> Optional[Dict]:
         title_guess = " ".join(tokens[1:]).strip()
 
     attempts = []
-
-    # 1) Structured (best when author detected)
     if author_guess and title_guess:
         attempts.append(("structured", {"title": title_guess, "author": author_guess, "limit": 10}))
-
-    # 2) Title-only
     if title_guess:
         attempts.append(("title_only", {"title": title_guess, "limit": 10}))
-
-    # 3) General query
     attempts.append(("q", {"q": q, "limit": 10}))
 
     best = None
@@ -378,18 +372,42 @@ def openlibrary_lookup(query: str) -> Optional[Dict]:
             )
         except Exception as e:
             logging.error("OpenLibrary request failed (%s): %s", mode, e)
+            if debug_log is not None:
+                debug_log.append({"stage": "openlibrary", "mode": mode, "params": params, "error": str(e)})
             continue
 
         if resp.status_code != 200:
             logging.error("OpenLibrary bad status (%s): %s", mode, resp.status_code)
+            if debug_log is not None:
+                debug_log.append({"stage": "openlibrary", "mode": mode, "params": params, "status": resp.status_code})
             continue
 
         data = resp.json()
         docs = data.get("docs") or []
+
+        if debug_log is not None:
+            top_docs = []
+            for d in docs[:3]:
+                isbns = d.get("isbn") or []
+                top_docs.append({
+                    "title": _short(d.get("title") or "", 90),
+                    "author": _short(((d.get("author_name") or [""])[0] or ""), 60),
+                    "has_isbn": bool(isbns),
+                    "isbn_sample": (isbns[0] if isbns else ""),
+                })
+            debug_log.append({
+                "stage": "openlibrary",
+                "mode": mode,
+                "params": params,
+                "returned_docs": len(docs),
+                "top_docs": top_docs,
+            })
+
         if not docs:
             continue
 
         q_words = set(re.findall(r"[a-z0-9]+", q))
+
         for d in docs:
             isbns = d.get("isbn") or []
             if not isbns:
@@ -400,8 +418,8 @@ def openlibrary_lookup(query: str) -> Optional[Dict]:
             author = authors[0].strip() if authors else ""
 
             chosen_isbn = None
-            for raw in isbns:
-                norm = normalize_isbn(raw)
+            for raw_isbn in isbns:
+                norm = normalize_isbn(raw_isbn)
                 if norm:
                     chosen_isbn = norm
                     break
@@ -422,20 +440,18 @@ def openlibrary_lookup(query: str) -> Optional[Dict]:
                     "match_score": score,
                 }
 
-        # If we found something decent via structured search, stop early.
+        # stop early if structured got something decent
         if best and best_score >= 2 and mode == "structured":
             break
 
     return best
 
 
-
-def resolve_candidate(candidate: Dict) -> Dict:
+def resolve_candidate(candidate: Dict, debug_log: Optional[List[Dict]] = None) -> Dict:
     query = candidate["raw"]
 
-    ol = openlibrary_lookup(query)
+    ol = openlibrary_lookup(query, debug_log=debug_log)
     if ol:
-        # Conservative confidence blending
         ocr_conf = max(0.0, min(candidate["ocr_conf"], 95.0)) / 100.0
         match_norm = 0.3 + 0.1 * (ol.get("match_score", 0))
         blended = max(0.25, min(0.95, 0.45 * ocr_conf + 0.55 * (match_norm / 3.0)))
@@ -457,8 +473,6 @@ def resolve_candidate(candidate: Dict) -> Dict:
 
 
 # ---------- UI ----------
-# IMPORTANT CHANGE:
-# Return HTML with NO-CACHE headers so iPhone Safari can’t keep serving an old copy of the page.
 
 @app.get("/")
 def index():
@@ -486,6 +500,8 @@ def index():
     #isbnBox {{ width: 100%; margin-top: 8px; font-size: 0.8rem; padding:8px; box-sizing:border-box; }}
     #fileName {{ font-size: 0.85rem; color:#333; margin-top: 6px; }}
     .muted {{ color:#666; font-size:0.85rem; }}
+    #debugBox {{ width: 100%; margin-top: 10px; font-size: 0.75rem; padding:8px; box-sizing:border-box; display:none; }}
+    label.muted {{ display:block; margin-top: 6px; }}
   </style>
 </head>
 <body>
@@ -502,6 +518,11 @@ def index():
   </div>
 
   <div id="fileName" class="muted">No photo selected.</div>
+
+  <label class="muted">
+    <input type="checkbox" id="debugMode" />
+    Debug mode (show OCR + lookup details)
+  </label>
 
   <div class="row">
     <button class="primary" onclick="processImage()">Process Photo</button>
@@ -526,6 +547,8 @@ def index():
 
   <textarea id="isbnBox" rows="4" readonly style="display:none;"></textarea>
   <button id="copyBtn" class="secondary" style="display:none;" onclick="copyIsbns()">Copy ISBN Column</button>
+
+  <textarea id="debugBox" rows="12" readonly></textarea>
 
 <script>
 let selectedFile = null;
@@ -553,6 +576,9 @@ async function processImage() {{
   const tbody = table.querySelector('tbody');
   const isbnBox = document.getElementById('isbnBox');
   const copyBtn = document.getElementById('copyBtn');
+  const debugBox = document.getElementById('debugBox');
+
+  const debugOn = document.getElementById('debugMode')?.checked;
 
   if (!selectedFile) {{
     status.textContent = 'Choose a photo first.';
@@ -565,6 +591,7 @@ async function processImage() {{
 
   const formData = new FormData();
   formData.append('file', selectedFile);
+  formData.append('debug', debugOn ? '1' : '0');
 
   status.textContent = 'Processing... (will time out if it takes too long) — build {BUILD_STAMP}';
   table.style.display = 'none';
@@ -572,6 +599,8 @@ async function processImage() {{
   isbnBox.style.display = 'none';
   isbnBox.value = '';
   copyBtn.style.display = 'none';
+  debugBox.style.display = 'none';
+  debugBox.value = '';
 
   // Hard client timeout so UI never hangs forever
   const timeoutMs = 35000;
@@ -593,6 +622,12 @@ async function processImage() {{
 
     const data = await resp.json();
     const books = data.books || [];
+    const meta = data.meta || null;
+
+    if (debugOn && data.debug) {{
+      debugBox.value = JSON.stringify(data.debug, null, 2);
+      debugBox.style.display = 'block';
+    }}
 
     if (!books.length) {{
       status.textContent = 'No candidates detected. Try a closer or clearer shot.';
@@ -620,9 +655,11 @@ async function processImage() {{
       isbnBox.value = isbnList.join('\\n');
       isbnBox.style.display = 'block';
       copyBtn.style.display = 'inline-block';
-      status.textContent = `Done. ${{isbnList.length}} ISBNs ready to copy. (build {BUILD_STAMP})`;
+      const elapsed = meta && meta.elapsed_s != null ? ` (elapsed {meta.elapsed_s}s)` : '';
+      status.textContent = `Done. ${{isbnList.length}} ISBNs ready to copy. (build {BUILD_STAMP})${{elapsed}}`;
     }} else {{
-      status.textContent = 'Done. No ISBNs resolved — try again with a clearer photo.';
+      const elapsed = meta && meta.elapsed_s != null ? ` (elapsed {meta.elapsed_s}s)` : '';
+      status.textContent = 'Done. No ISBNs resolved — try again with a clearer photo.' + elapsed;
     }}
   }} catch (e) {{
     if (e.name === 'AbortError') {{
@@ -647,6 +684,11 @@ function clearAll() {{
   document.getElementById('isbnBox').style.display = 'none';
   document.getElementById('isbnBox').value = '';
   document.getElementById('copyBtn').style.display = 'none';
+
+  const debugBox = document.getElementById('debugBox');
+  debugBox.style.display = 'none';
+  debugBox.value = '';
+
   if (currentController) currentController.abort();
 }}
 
@@ -666,7 +708,6 @@ async function copyIsbns() {{
 </html>
     """
 
-    # No-cache headers: prevents iPhone Safari from reusing an old copy of "/"
     return HTMLResponse(
         content=html,
         headers={
@@ -680,12 +721,18 @@ async function copyIsbns() {{
 # ---------- API ENDPOINT ----------
 
 @app.post("/api/bookshelf")
-async def process_bookshelf(file: UploadFile = File(...)):
+async def process_bookshelf(
+    file: UploadFile = File(...),
+    debug: str = Form("0"),
+):
     """
     Core OCR → candidate → lookup pipeline.
     Hardened to avoid long hangs on large photos.
+    Debug mode returns extra info (first few lookups + OCR lines).
     """
     started = time.time()
+    debug_on = (debug == "1")
+    debug_blob = {"ocr_lines": [], "candidates": [], "lookups": []} if debug_on else None
 
     content = await file.read()
     try:
@@ -700,16 +747,36 @@ async def process_bookshelf(file: UploadFile = File(...)):
     except RuntimeError as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+    if debug_on:
+        debug_blob["ocr_lines"] = [
+            {"text": _short(x.get("text", ""), 120), "conf": round(float(x.get("conf", 0.0)), 1), "angle": x.get("angle", "")}
+            for x in (ocr_lines[:25] if ocr_lines else [])
+        ]
+
     candidates = generate_candidates(ocr_lines)
+
+    if debug_on:
+        debug_blob["candidates"] = [
+            {"raw": _short(c.get("raw", ""), 120), "ocr_conf": round(float(c.get("ocr_conf", 0.0)), 1)}
+            for c in candidates
+        ]
 
     books = []
     for idx, cand in enumerate(candidates, start=1):
-        # Soft budget: stop doing lookups if we're taking too long
         if time.time() - started > TOTAL_SOFT_BUDGET_SECONDS:
             logging.warning("Stopping early due to time budget; returning partial results.")
             break
 
-        resolved = resolve_candidate(cand)
+        # only log details for first few candidates to keep payload small
+        lookup_log = [] if (debug_on and idx <= 3) else None
+        resolved = resolve_candidate(cand, debug_log=lookup_log)
+
+        if debug_on and lookup_log is not None:
+            debug_blob["lookups"].append({
+                "candidate_raw": _short(cand.get("raw", ""), 140),
+                "events": lookup_log,
+            })
+
         books.append(
             {
                 "position": idx,
@@ -721,13 +788,17 @@ async def process_bookshelf(file: UploadFile = File(...)):
             }
         )
 
-    return {"books": books, "meta": {"candidates_used": len(books), "elapsed_s": round(time.time() - started, 2)}}
+    resp = {
+        "books": books,
+        "meta": {
+            "candidates_used": len(books),
+            "elapsed_s": round(time.time() - started, 2),
+        },
+    }
+    if debug_on:
+        resp["debug"] = debug_blob
+
+    return resp
 
 # To run locally:
 # uvicorn main:app --host 0.0.0.0 --port 8000
-
-
-
-
-
-
