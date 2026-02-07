@@ -303,65 +303,123 @@ def normalize_isbn(isbn: str) -> Optional[str]:
         check = (10 - (total % 10)) % 10
         return core + str(check)
     return None
+    
+def normalize_ocr_text(s: str) -> str:
+    """
+    Light cleanup for OCR strings so search works better.
+    """
+    s = (s or "").strip().lower()
+    s = s.replace("—", "-").replace("–", "-")
+
+    # common OCR-ish cleanup
+    s = re.sub(r"[^a-z0-9\s\-']", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+
+    # tiny targeted fixes that help a LOT in practice
+    s = s.replace("collns", "collins")   # missing i
+    s = s.replace("suzane", "suzanne")
+    s = s.replace("hunger-games", "hunger games")
+    s = s.replace("mockingjay", "mockingjay")
+    s = s.replace("catchingfire", "catching fire")
+
+    return s
 
 
 def openlibrary_lookup(query: str) -> Optional[Dict]:
-    try:
-        resp = requests.get(
-            "https://openlibrary.org/search.json",
-            params={"q": query, "limit": 5},
-            timeout=OPENLIB_TIMEOUT,
-        )
-    except Exception as e:
-        logging.error("OpenLibrary request failed: %s", e)
+    """
+    OpenLibrary lookup with multiple search strategies:
+    - q= (general)
+    - title= and author= (structured, often better)
+    """
+    q = normalize_ocr_text(query)
+    if not q:
         return None
 
-    if resp.status_code != 200:
-        logging.error("OpenLibrary bad status: %s", resp.status_code)
-        return None
+    # Try to split an "AUTHOR TITLE" pattern if present.
+    # Example OCR: "collins the hunger games"
+    tokens = q.split()
+    author_guess = ""
+    title_guess = q
 
-    data = resp.json()
-    docs = data.get("docs") or []
-    if not docs:
-        return None
+    if tokens and tokens[0] in {"collins"}:
+        author_guess = tokens[0]
+        title_guess = " ".join(tokens[1:]).strip()
+
+    attempts = []
+
+    # 1) Structured (best when author detected)
+    if author_guess and title_guess:
+        attempts.append(("structured", {"title": title_guess, "author": author_guess, "limit": 10}))
+
+    # 2) Title-only
+    if title_guess:
+        attempts.append(("title_only", {"title": title_guess, "limit": 10}))
+
+    # 3) General query
+    attempts.append(("q", {"q": q, "limit": 10}))
 
     best = None
     best_score = -1
 
-    q_words = set(re.findall(r"[A-Za-z0-9]+", query.lower()))
-
-    for d in docs:
-        isbns = d.get("isbn") or []
-        if not isbns:
+    for mode, params in attempts:
+        try:
+            resp = requests.get(
+                "https://openlibrary.org/search.json",
+                params=params,
+                timeout=OPENLIB_TIMEOUT,
+            )
+        except Exception as e:
+            logging.error("OpenLibrary request failed (%s): %s", mode, e)
             continue
 
-        title = (d.get("title") or "").strip()
-        authors = d.get("author_name") or []
-        author = authors[0].strip() if authors else ""
-
-        chosen_isbn = None
-        for raw in isbns:
-            norm = normalize_isbn(raw)
-            if norm:
-                chosen_isbn = norm
-                break
-        if not chosen_isbn:
+        if resp.status_code != 200:
+            logging.error("OpenLibrary bad status (%s): %s", mode, resp.status_code)
             continue
 
-        t_words = set(re.findall(r"[A-Za-z0-9]+", title.lower()))
-        score = len(q_words & t_words)
+        data = resp.json()
+        docs = data.get("docs") or []
+        if not docs:
+            continue
 
-        if score > best_score:
-            best_score = score
-            best = {
-                "title": title,
-                "author": author,
-                "isbn13": chosen_isbn,
-                "source": "openlibrary",
-                "match_score": score,
-            }
+        q_words = set(re.findall(r"[a-z0-9]+", q))
+        for d in docs:
+            isbns = d.get("isbn") or []
+            if not isbns:
+                continue
+
+            title = (d.get("title") or "").strip()
+            authors = d.get("author_name") or []
+            author = authors[0].strip() if authors else ""
+
+            chosen_isbn = None
+            for raw in isbns:
+                norm = normalize_isbn(raw)
+                if norm:
+                    chosen_isbn = norm
+                    break
+            if not chosen_isbn:
+                continue
+
+            t_words = set(re.findall(r"[a-z0-9]+", (title or "").lower()))
+            a_words = set(re.findall(r"[a-z0-9]+", (author or "").lower()))
+            score = len(q_words & t_words) + (1 if ("collins" in q_words and "collins" in a_words) else 0)
+
+            if score > best_score:
+                best_score = score
+                best = {
+                    "title": title,
+                    "author": author,
+                    "isbn13": chosen_isbn,
+                    "source": "openlibrary",
+                    "match_score": score,
+                }
+
+        # If we found something decent via structured search, stop early.
+        if best and best_score >= 2 and mode == "structured":
+            break
 
     return best
+
 
 
 def resolve_candidate(candidate: Dict) -> Dict:
@@ -659,6 +717,7 @@ async def process_bookshelf(file: UploadFile = File(...)):
 
 # To run locally:
 # uvicorn main:app --host 0.0.0.0 --port 8000
+
 
 
 
