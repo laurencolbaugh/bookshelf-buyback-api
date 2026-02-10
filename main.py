@@ -875,3 +875,15 @@ async def process_bookshelf(
 
 # To run locally:
 # uvicorn main:app --host 0.0.0.0 --port 8000
+
+@app.get("/health/paddle")
+def health_paddle():
+    try:
+        import paddle  # noqa
+        from paddleocr import PaddleOCR  # noqa
+        import cv2  # noqa
+        import numpy as np  # noqa
+        return {"ok": True, "paddleocr": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
