@@ -11,6 +11,10 @@ from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 import pytesseract
 from pytesseract import TesseractNotFoundError
 
+import numpy as np
+import cv2
+from paddleocr import PaddleOCR
+
 # Point pytesseract to the Tesseract binary inside our Docker image.
 pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
@@ -886,4 +890,5 @@ def health_paddle():
         return {"ok": True, "paddleocr": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
 
