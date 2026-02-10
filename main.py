@@ -43,7 +43,7 @@ SPINE_SLICE_OVERLAP_PX = 40         # overlap so text near edges isn't lost
 SPINE_MIN_STRIP_WIDTH = 140         # skip too-thin strips
 
 # Build stamp (lets us confirm the phone is loading the newest HTML)
-BUILD_STAMP = "2026-02-07-E"
+BUILD_STAMP = "2026-02-10-A"
 
 
 @app.get("/check-isbns")
@@ -80,7 +80,7 @@ def downscale_for_ocr(image: Image.Image) -> Image.Image:
     return image.resize((new_w, new_h), Image.LANCZOS)
 
 
-# ---------- OCR HELPERS ----------
+# ---------- OCR HELPERS (Tesseract pipeline you already had) ----------
 
 def extract_ocr_lines(image: Image.Image) -> List[Dict]:
     """
@@ -318,23 +318,13 @@ def normalize_isbn(isbn: str) -> Optional[str]:
 def normalize_ocr_text(s: str) -> str:
     """
     Repair common OCR spine breakage and normalize for searching.
-    (Keep this conservative; debug mode will tell us what to add next.)
     """
     s = (s or "").strip().lower()
-
-    # Join broken fragments
     s = s.replace("\n", " ")
-
-    # Reduce weird punctuation into spaces
     s = s.replace("—", " ").replace("–", " ").replace("-", " ")
-
-    # Known common fixups
     s = s.replace("collns", "collins")
-
-    # Remove junk chars
     s = re.sub(r"[^a-z0-9\s']", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-
     return s
 
 
@@ -342,13 +332,6 @@ COMMON_WORDS = {"the", "and", "of", "in", "on", "to", "for", "with", "a", "an"}
 
 
 def generate_query_variants(normalized: str) -> List[str]:
-    """
-    Given already-normalized OCR text, generate a few safer search variants:
-    - remove tiny junk tokens
-    - drop trailing junk
-    - merge adjacent tokens (common when words split on spines)
-    Keep this small to avoid slowing things down.
-    """
     s = (normalized or "").strip().lower()
     s = re.sub(r"\s+", " ", s).strip()
     if not s:
@@ -356,7 +339,6 @@ def generate_query_variants(normalized: str) -> List[str]:
 
     tokens = s.split()
 
-    # Drop short tokens that are usually junk (keep common words)
     filtered = []
     for t in tokens:
         if t in COMMON_WORDS:
@@ -364,7 +346,6 @@ def generate_query_variants(normalized: str) -> List[str]:
             continue
         if len(t) <= 2:
             continue
-        # Drop very common OCR junk tail tokens
         if t in {"mm", "rn", "lll", "ii"}:
             continue
         filtered.append(t)
@@ -373,19 +354,14 @@ def generate_query_variants(normalized: str) -> List[str]:
         return []
 
     base = " ".join(filtered)
-
-    # Variant: drop last token (often junk on spines)
     drop_last = " ".join(filtered[:-1]).strip() if len(filtered) >= 3 else ""
 
-    # Variant: merge adjacent pairs (helps "hun" + "ger" -> "hunger")
     merged_tokens = []
     i = 0
     while i < len(filtered):
         if i + 1 < len(filtered):
-            combo = filtered[i] + filtered[i + 1]
-            # Only merge when both are short-ish fragments (common split-word pattern)
             if 3 <= len(filtered[i]) <= 5 and 3 <= len(filtered[i + 1]) <= 5:
-                merged_tokens.append(combo)
+                merged_tokens.append(filtered[i] + filtered[i + 1])
                 i += 2
                 continue
         merged_tokens.append(filtered[i])
@@ -402,13 +378,6 @@ def generate_query_variants(normalized: str) -> List[str]:
 
 
 def openlibrary_lookup(query: str, debug_log: Optional[List[Dict]] = None) -> Optional[Dict]:
-    """
-    OpenLibrary lookup with multiple search strategies:
-    - title+author (structured)
-    - title-only
-    - q= general
-    Plus: we try a few query variants to survive messy OCR.
-    """
     q = normalize_ocr_text(query)
     if not q:
         if debug_log is not None:
@@ -429,7 +398,6 @@ def openlibrary_lookup(query: str, debug_log: Optional[List[Dict]] = None) -> Op
         author_guess = ""
         title_guess = qv
 
-        # Very conservative author guess (only when first token is a known surname we’ve seen)
         if tokens and tokens[0] in {"collins"} and len(tokens) >= 3:
             author_guess = tokens[0]
             title_guess = " ".join(tokens[1:]).strip()
@@ -518,11 +486,9 @@ def openlibrary_lookup(query: str, debug_log: Optional[List[Dict]] = None) -> Op
                         "match_score": score,
                     }
 
-            # stop early if structured got something decent
             if best and best_score >= 2 and mode == "structured":
                 break
 
-        # If any variant produces a decent match, stop trying more variants
         if best and best_score >= 2:
             break
 
@@ -590,7 +556,7 @@ def index():
 <body>
   <h1>Bookshelf → ISBN Helper</h1>
   <p class="muted">Build: {BUILD_STAMP}</p>
-  <p>Upload a clear shelf photo. If it takes too long, the app will time out instead of hanging forever.</p>
+  <p>Upload a clear shelf photo. Preview it and rotate if needed before processing.</p>
 
   <input id="fileCamera" type="file" accept="image/*" capture="environment" style="display:none" />
   <input id="fileLibrary" type="file" accept="image/*" style="display:none" />
@@ -601,6 +567,17 @@ def index():
   </div>
 
   <div id="fileName" class="muted">No photo selected.</div>
+
+  <div class="row">
+    <button id="rotLeft" class="ghost" onclick="rotateLeft()" disabled>Rotate ⟲</button>
+    <button id="rotRight" class="ghost" onclick="rotateRight()" disabled>Rotate ⟳</button>
+    <div class="muted" style="align-self:center;">Rotation: <span id="rotLabel">0°</span></div>
+  </div>
+
+  <div style="margin-top:10px; background:#fff; border:1px dashed #d8d2c8; border-radius:10px; padding:10px;">
+    <img id="preview" alt="Preview" style="max-width:100%; height:auto; display:none; transform-origin:center center;" />
+    <div id="noPreview" class="muted">No preview yet.</div>
+  </div>
 
   <label class="muted">
     <input type="checkbox" id="debugMode" />
@@ -636,11 +613,52 @@ def index():
 <script>
 let selectedFile = null;
 let currentController = null;
+let rotationDegrees = 0;
+
+function setRotation(deg) {{
+  rotationDegrees = ((deg % 360) + 360) % 360;
+  const img = document.getElementById('preview');
+  const label = document.getElementById('rotLabel');
+  if (label) label.textContent = rotationDegrees + "°";
+  if (img) img.style.transform = `rotate(${{rotationDegrees}}deg)`;
+}}
+
+function enableRotateButtons(enabled) {{
+  const l = document.getElementById('rotLeft');
+  const r = document.getElementById('rotRight');
+  if (l) l.disabled = !enabled;
+  if (r) r.disabled = !enabled;
+}}
+
+function rotateLeft() {{ setRotation(rotationDegrees - 90); }}
+function rotateRight() {{ setRotation(rotationDegrees + 90); }}
 
 function setSelectedFile(file) {{
   selectedFile = file || null;
+
   const fileNameEl = document.getElementById('fileName');
   fileNameEl.textContent = selectedFile ? ("Selected: " + (selectedFile.name || "photo")) : "No photo selected.";
+
+  const img = document.getElementById('preview');
+  const noPrev = document.getElementById('noPreview');
+
+  if (!selectedFile) {{
+    if (img) {{ img.src = ""; img.style.display = "none"; }}
+    if (noPrev) noPrev.style.display = "block";
+    enableRotateButtons(false);
+    setRotation(0);
+    return;
+  }}
+
+  setRotation(0);
+  enableRotateButtons(true);
+
+  const url = URL.createObjectURL(selectedFile);
+  if (img) {{
+    img.src = url;
+    img.style.display = "block";
+  }}
+  if (noPrev) noPrev.style.display = "none";
 }}
 
 function chooseCamera() {{ document.getElementById('fileCamera').click(); }}
@@ -668,13 +686,13 @@ async function processImage() {{
     return;
   }}
 
-  // Cancel any prior request
   if (currentController) currentController.abort();
   currentController = new AbortController();
 
   const formData = new FormData();
   formData.append('file', selectedFile);
   formData.append('debug', debugOn ? '1' : '0');
+  formData.append('rotation_degrees', String(rotationDegrees));
 
   status.textContent = 'Processing... (will time out if it takes too long) — build {BUILD_STAMP}';
   table.style.display = 'none';
@@ -685,7 +703,6 @@ async function processImage() {{
   debugBox.style.display = 'none';
   debugBox.value = '';
 
-  // Hard client timeout so UI never hangs forever
   const timeoutMs = 35000;
   const timeoutId = setTimeout(() => currentController.abort(), timeoutMs);
 
@@ -760,8 +777,18 @@ function clearAll() {{
   document.getElementById('fileCamera').value = '';
   document.getElementById('fileLibrary').value = '';
   selectedFile = null;
+  rotationDegrees = 0;
+
   document.getElementById('fileName').textContent = 'No photo selected.';
   document.getElementById('status').textContent = '';
+
+  const img = document.getElementById('preview');
+  const noPrev = document.getElementById('noPreview');
+  if (img) {{ img.src = ""; img.style.display = "none"; img.style.transform = "rotate(0deg)"; }}
+  if (noPrev) noPrev.style.display = "block";
+  enableRotateButtons(false);
+  setRotation(0);
+
   document.getElementById('resultsTable').style.display = 'none';
   document.getElementById('resultsTable').querySelector('tbody').innerHTML = '';
   document.getElementById('isbnBox').style.display = 'none';
@@ -807,6 +834,7 @@ async function copyIsbns() {{
 async def process_bookshelf(
     file: UploadFile = File(...),
     debug: str = Form("0"),
+    rotation_degrees: int = Form(0),
 ):
     """
     Core OCR → candidate → lookup pipeline.
@@ -820,7 +848,12 @@ async def process_bookshelf(
     content = await file.read()
     try:
         image = Image.open(io.BytesIO(content))
-        image = image.convert("RGB")
+
+        # Respect iPhone EXIF orientation first, then apply manual rotation from UI.
+        image = ImageOps.exif_transpose(image).convert("RGB")
+        if rotation_degrees % 360 != 0:
+            image = image.rotate(-rotation_degrees, expand=True)
+
         image = downscale_for_ocr(image)
     except Exception:
         return JSONResponse(status_code=400, content={"error": "Unable to read image file."})
@@ -838,9 +871,52 @@ async def process_bookshelf(
 
     candidates = generate_candidates(ocr_lines)
 
-   # To run locally:
-# uvicorn main:app --host 0.0.0.0 --port 8000
+    if debug_on:
+        debug_blob["candidates"] = [
+            {"raw": _short(c.get("raw", ""), 120), "ocr_conf": round(float(c.get("ocr_conf", 0.0)), 1)}
+            for c in candidates
+        ]
 
+    books = []
+    for idx, cand in enumerate(candidates, start=1):
+        if time.time() - started > TOTAL_SOFT_BUDGET_SECONDS:
+            logging.warning("Stopping early due to time budget; returning partial results.")
+            break
+
+        lookup_log = [] if (debug_on and idx <= 3) else None
+        resolved = resolve_candidate(cand, debug_log=lookup_log)
+
+        if debug_on and lookup_log is not None:
+            debug_blob["lookups"].append({
+                "candidate_raw": _short(cand.get("raw", ""), 140),
+                "events": lookup_log,
+            })
+
+        books.append(
+            {
+                "position": idx,
+                "title": resolved["title"],
+                "author": resolved.get("author", ""),
+                "isbn": resolved.get("isbn13", ""),
+                "confidence": resolved.get("confidence", 0.0),
+                "source": resolved.get("source", "unknown"),
+            }
+        )
+
+    resp = {
+        "books": books,
+        "meta": {
+            "candidates_used": len(books),
+            "elapsed_s": round(time.time() - started, 2),
+        },
+    }
+    if debug_on:
+        resp["debug"] = debug_blob
+
+    return resp
+
+
+# ---------- HEALTH / PADDLE TEST ----------
 
 @app.get("/health/paddle")
 def health_paddle():
@@ -857,62 +933,48 @@ def health_paddle():
 @app.post("/ocr/paddle")
 async def ocr_paddle(
     file: UploadFile = File(...),
-    rotation_degrees: int = Form(0),   # <-- NEW: receive rotation
+    rotation_degrees: int = Form(0),
 ):
     raw = await file.read()
 
-    # Load image
     img = Image.open(io.BytesIO(raw))
     img = ImageOps.exif_transpose(img).convert("RGB")
 
-    # Apply manual rotation from UI
     if rotation_degrees % 360 != 0:
         img = img.rotate(-rotation_degrees, expand=True)
 
-    # Downscale (reuse your existing knob)
     w, h = img.size
     long_edge = max(w, h)
-
     if long_edge > MAX_IMAGE_LONG_EDGE:
         scale = MAX_IMAGE_LONG_EDGE / long_edge
-        img = img.resize(
-            (int(w * scale), int(h * scale)),
-            Image.LANCZOS
-        )
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
-    # PIL -> OpenCV BGR
     rgb = np.array(img)
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
-    # Run PaddleOCR
     result = paddle_ocr.ocr(bgr, cls=True)
 
     lines = []
-
     if result and result[0]:
         for (box, (text, conf)) in result[0]:
             if not text:
                 continue
-
             lines.append({
                 "text": " ".join(text.strip().split()),
                 "conf": float(conf),
-                "box": box,  # [[x,y],[x,y],[x,y],[x,y]]
+                "box": box,
             })
 
-    # Helper: box center
     def center_xy(box):
         xs = [p[0] for p in box]
         ys = [p[1] for p in box]
         return (sum(xs) / 4.0, sum(ys) / 4.0)
 
-    # Attach centers
     for ln in lines:
         cx, cy = center_xy(ln["box"])
         ln["cx"] = cx
         ln["cy"] = cy
 
-    # Sort: top → bottom, then left → right
     lines.sort(key=lambda x: (x["cy"], x["cx"]))
 
     return {
@@ -920,6 +982,3 @@ async def ocr_paddle(
         "rotation_used": rotation_degrees,
         "lines": lines,
     }
-
-
-
