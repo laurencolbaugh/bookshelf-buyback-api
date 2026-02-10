@@ -897,5 +897,53 @@ def health_paddle():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+@app.post("/ocr/paddle")
+async def ocr_paddle(file: UploadFile = File(...)):
+    raw = await file.read()
+
+    # Load image (handles iPhone rotation too, if you already use ImageOps.exif_transpose elsewhere)
+    img = Image.open(io.BytesIO(raw))
+    img = ImageOps.exif_transpose(img).convert("RGB")
+
+    # Optional: downscale like you already do (reuse your MAX_IMAGE_LONG_EDGE)
+    w, h = img.size
+    long_edge = max(w, h)
+    if long_edge > MAX_IMAGE_LONG_EDGE:
+        scale = MAX_IMAGE_LONG_EDGE / long_edge
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    # PIL -> OpenCV BGR
+    rgb = np.array(img)
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+    # Run PaddleOCR
+    result = paddle_ocr.ocr(bgr, cls=True)
+
+    lines = []
+    if result and result[0]:
+        for (box, (text, conf)) in result[0]:
+            if not text:
+                continue
+            lines.append({
+                "text": " ".join(text.strip().split()),
+                "conf": float(conf),
+                "box": box,  # 4 points: [[x,y],[x,y],[x,y],[x,y]]
+            })
+
+    # Sort roughly left-to-right, top-to-bottom (simple + reliable starter)
+    def center_xy(box):
+        xs = [p[0] for p in box]
+        ys = [p[1] for p in box]
+        return (sum(xs) / 4.0, sum(ys) / 4.0)
+
+    for ln in lines:
+        cx, cy = center_xy(ln["box"])
+        ln["cx"] = cx
+        ln["cy"] = cy
+
+    lines.sort(key=lambda x: (x["cy"], x["cx"]))
+
+    return {"count": len(lines), "lines": lines}
+
 
 
