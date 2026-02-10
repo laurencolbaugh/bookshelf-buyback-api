@@ -12,6 +12,7 @@
     }
     h1 { font-size: 1.4rem; margin-bottom: 0.2rem; }
     .hint { font-size: 0.85rem; color: #555; margin-bottom: 0.75rem; }
+
     textarea {
       width: 100%;
       height: 120px;
@@ -44,13 +45,63 @@
       vertical-align: top;
     }
     th { background: #f5f5f5; }
-    tr.buyback-yes {
-      background: #e8f8ec;
+    tr.buyback-yes { background: #e8f8ec; }
+
+    /* New: scan UI */
+    .scan-box {
+      border: 1px solid #ddd;
+      padding: 0.75rem;
+      border-radius: 8px;
+      margin-bottom: 0.75rem;
+      background: #fafafa;
     }
+    .row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+    .preview-wrap {
+      margin-top: 0.5rem;
+      border: 1px dashed #ccc;
+      padding: 0.5rem;
+      border-radius: 8px;
+      background: white;
+    }
+    #preview {
+      max-width: 100%;
+      height: auto;
+      display: none;
+      transform-origin: center center;
+    }
+    .small {
+      font-size: 0.8rem;
+      color: #555;
+      margin-top: 0.4rem;
+    }
+    code { font-size: 0.82rem; }
   </style>
 </head>
 <body>
   <h1>Bookshelf Buyback Checker</h1>
+
+  <!-- NEW: Bookshelf scan UI -->
+  <div class="scan-box">
+    <div class="hint" style="margin-bottom:0.4rem;">
+      Optional: Upload a bookshelf photo, rotate if needed, then click “Extract Text (OCR)”.
+      (This calls: <code>https://bookshelf-buyback-api.onrender.com/ocr/paddle</code>)
+    </div>
+
+    <div class="row">
+      <input id="photoInput" type="file" accept="image/*" />
+      <button id="rotateLeftBtn" disabled>Rotate ⟲</button>
+      <button id="rotateRightBtn" disabled>Rotate ⟳</button>
+      <button id="ocrBtn" disabled>Extract Text (OCR)</button>
+    </div>
+
+    <div class="small">Rotation: <span id="rotationLabel">0°</span></div>
+
+    <div class="preview-wrap">
+      <img id="preview" alt="Preview" />
+      <div id="noPreview" class="small">No image selected.</div>
+    </div>
+  </div>
+
   <div class="hint">
     Paste ISBNs (one per line) and click "Check Buyback". This calls:
     <code>https://bookshelf-buyback-api.onrender.com/check-isbns</code>.
@@ -76,7 +127,9 @@
   </table>
 
   <script>
-    const API_URL = "https://bookshelf-buyback-api.onrender.com/check-isbns";
+    const CHECK_API_URL = "https://bookshelf-buyback-api.onrender.com/check-isbns";
+    const OCR_API_URL   = "https://bookshelf-buyback-api.onrender.com/ocr/paddle";
+
     const isbnInput = document.getElementById('isbnInput');
     const checkBtn = document.getElementById('checkBtn');
     const copyBtn = document.getElementById('copyBtn');
@@ -84,8 +137,32 @@
     const table = document.getElementById('resultsTable');
     const tbody = table.querySelector('tbody');
 
+    // NEW scan elements
+    const photoInput = document.getElementById('photoInput');
+    const rotateLeftBtn = document.getElementById('rotateLeftBtn');
+    const rotateRightBtn = document.getElementById('rotateRightBtn');
+    const ocrBtn = document.getElementById('ocrBtn');
+    const previewImg = document.getElementById('preview');
+    const noPreview = document.getElementById('noPreview');
+    const rotationLabel = document.getElementById('rotationLabel');
+
+    let selectedFile = null;
+    let rotationDegrees = 0; // 0, 90, 180, 270
+
     function setStatus(msg) {
       statusEl.textContent = msg;
+    }
+
+    function setRotation(deg) {
+      rotationDegrees = ((deg % 360) + 360) % 360;
+      rotationLabel.textContent = rotationDegrees + "°";
+      previewImg.style.transform = `rotate(${rotationDegrees}deg)`;
+    }
+
+    function enableScanButtons(enabled) {
+      rotateLeftBtn.disabled = !enabled;
+      rotateRightBtn.disabled = !enabled;
+      ocrBtn.disabled = !enabled;
     }
 
     function parseIsbns(text) {
@@ -99,7 +176,7 @@
       setStatus("Checking " + isbns.length + " ISBN(s)...");
 
       try {
-        const res = await fetch(API_URL, {
+        const res = await fetch(CHECK_API_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ isbns })
@@ -182,6 +259,79 @@
         setStatus("Failed to copy ISBNs.");
       });
     }
+
+    // NEW: load preview
+    photoInput.addEventListener("change", () => {
+      const file = photoInput.files && photoInput.files[0];
+      if (!file) {
+        selectedFile = null;
+        previewImg.style.display = "none";
+        noPreview.style.display = "";
+        enableScanButtons(false);
+        setRotation(0);
+        return;
+      }
+
+      selectedFile = file;
+      setRotation(0);
+      enableScanButtons(true);
+
+      const url = URL.createObjectURL(file);
+      previewImg.src = url;
+      previewImg.style.display = "";
+      noPreview.style.display = "none";
+    });
+
+    rotateLeftBtn.addEventListener("click", () => setRotation(rotationDegrees - 90));
+    rotateRightBtn.addEventListener("click", () => setRotation(rotationDegrees + 90));
+
+    // NEW: call OCR endpoint
+    ocrBtn.addEventListener("click", async () => {
+      if (!selectedFile) {
+        setStatus("Choose a photo first.");
+        return;
+      }
+
+      setStatus("Running OCR...");
+
+      try {
+        const form = new FormData();
+        form.append("file", selectedFile);
+        form.append("rotation_degrees", String(rotationDegrees));
+
+        const res = await fetch(OCR_API_URL, {
+          method: "POST",
+          body: form
+        });
+
+        if (!res.ok) {
+          setStatus("OCR error: " + res.status + " " + res.statusText);
+          return;
+        }
+
+        const data = await res.json();
+
+        // Expecting: { count, lines: [{text, conf, ...}, ...] }
+        const lines = (data && data.lines) ? data.lines : [];
+
+        if (!lines.length) {
+          setStatus("OCR returned no text. Try a clearer photo.");
+          return;
+        }
+
+        // Put extracted text into textarea (one line per OCR line)
+        const text = lines
+          .map(x => x.text)
+          .filter(Boolean)
+          .join("\n");
+
+        isbnInput.value = text;
+        setStatus("OCR done. Review/edit text, then use it as input for your next step.");
+      } catch (err) {
+        console.error(err);
+        setStatus("OCR request failed.");
+      }
+    });
 
     checkBtn.onclick = handleCheck;
     copyBtn.onclick = handleCopy;
