@@ -838,53 +838,9 @@ async def process_bookshelf(
 
     candidates = generate_candidates(ocr_lines)
 
-    if debug_on:
-        debug_blob["candidates"] = [
-            {"raw": _short(c.get("raw", ""), 120), "ocr_conf": round(float(c.get("ocr_conf", 0.0)), 1)}
-            for c in candidates
-        ]
-
-    books = []
-    for idx, cand in enumerate(candidates, start=1):
-        if time.time() - started > TOTAL_SOFT_BUDGET_SECONDS:
-            logging.warning("Stopping early due to time budget; returning partial results.")
-            break
-
-        # only log details for first few candidates to keep payload small
-        lookup_log = [] if (debug_on and idx <= 3) else None
-        resolved = resolve_candidate(cand, debug_log=lookup_log)
-
-        if debug_on and lookup_log is not None:
-            debug_blob["lookups"].append({
-                "candidate_raw": _short(cand.get("raw", ""), 140),
-                "events": lookup_log,
-            })
-
-        books.append(
-            {
-                "position": idx,
-                "title": resolved["title"],
-                "author": resolved.get("author", ""),
-                "isbn": resolved.get("isbn13", ""),
-                "confidence": resolved.get("confidence", 0.0),
-                "source": resolved.get("source", "unknown"),
-            }
-        )
-
-    resp = {
-        "books": books,
-        "meta": {
-            "candidates_used": len(books),
-            "elapsed_s": round(time.time() - started, 2),
-        },
-    }
-    if debug_on:
-        resp["debug"] = debug_blob
-
-    return resp
-
-# To run locally:
+   # To run locally:
 # uvicorn main:app --host 0.0.0.0 --port 8000
+
 
 @app.get("/health/paddle")
 def health_paddle():
@@ -897,20 +853,32 @@ def health_paddle():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+
 @app.post("/ocr/paddle")
-async def ocr_paddle(file: UploadFile = File(...)):
+async def ocr_paddle(
+    file: UploadFile = File(...),
+    rotation_degrees: int = Form(0),   # <-- NEW: receive rotation
+):
     raw = await file.read()
 
-    # Load image (handles iPhone rotation too, if you already use ImageOps.exif_transpose elsewhere)
+    # Load image
     img = Image.open(io.BytesIO(raw))
     img = ImageOps.exif_transpose(img).convert("RGB")
 
-    # Optional: downscale like you already do (reuse your MAX_IMAGE_LONG_EDGE)
+    # Apply manual rotation from UI
+    if rotation_degrees % 360 != 0:
+        img = img.rotate(-rotation_degrees, expand=True)
+
+    # Downscale (reuse your existing knob)
     w, h = img.size
     long_edge = max(w, h)
+
     if long_edge > MAX_IMAGE_LONG_EDGE:
         scale = MAX_IMAGE_LONG_EDGE / long_edge
-        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        img = img.resize(
+            (int(w * scale), int(h * scale)),
+            Image.LANCZOS
+        )
 
     # PIL -> OpenCV BGR
     rgb = np.array(img)
@@ -920,30 +888,38 @@ async def ocr_paddle(file: UploadFile = File(...)):
     result = paddle_ocr.ocr(bgr, cls=True)
 
     lines = []
+
     if result and result[0]:
         for (box, (text, conf)) in result[0]:
             if not text:
                 continue
+
             lines.append({
                 "text": " ".join(text.strip().split()),
                 "conf": float(conf),
-                "box": box,  # 4 points: [[x,y],[x,y],[x,y],[x,y]]
+                "box": box,  # [[x,y],[x,y],[x,y],[x,y]]
             })
 
-    # Sort roughly left-to-right, top-to-bottom (simple + reliable starter)
+    # Helper: box center
     def center_xy(box):
         xs = [p[0] for p in box]
         ys = [p[1] for p in box]
         return (sum(xs) / 4.0, sum(ys) / 4.0)
 
+    # Attach centers
     for ln in lines:
         cx, cy = center_xy(ln["box"])
         ln["cx"] = cx
         ln["cy"] = cy
 
+    # Sort: top → bottom, then left → right
     lines.sort(key=lambda x: (x["cy"], x["cx"]))
 
-    return {"count": len(lines), "lines": lines}
+    return {
+        "count": len(lines),
+        "rotation_used": rotation_degrees,
+        "lines": lines,
+    }
 
 
 
