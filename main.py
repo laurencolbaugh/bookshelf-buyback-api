@@ -22,6 +22,12 @@ logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Bookshelf OCR → ISBN Helper")
 
+paddle_ocr = PaddleOCR(
+    use_angle_cls=True,
+    lang="en",
+    show_log=False
+)
+
 # ---------------------------
 # Performance / reliability knobs
 # ---------------------------
@@ -890,5 +896,6 @@ def health_paddle():
         return {"ok": True, "paddleocr": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
 
 
