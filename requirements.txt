@@ -5,4 +5,8 @@ pytesseract==0.3.13
 Pillow==10.3.0
 requests==2.32.3
 
-
+paddlepaddle==2.6.2
+paddleocr==2.7.3
+opencv-python-headless==4.9.0.80
+rapidfuzz==3.6.2
+numpy==1.26.4
