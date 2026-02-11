@@ -574,8 +574,9 @@ def index():
     <div class="muted" style="align-self:center;">Rotation: <span id="rotLabel">0°</span></div>
   </div>
 
-  <div style="margin-top:10px; background:#fff; border:1px dashed #d8d2c8; border-radius:10px; padding:10px;">
-    <img id="preview" alt="Preview" style="max-width:100%; height:auto; display:none; transform-origin:center center;" />
+  <!-- Preview viewport: fixed height + overflow hidden so rotation can't cover buttons -->
+  <div id="previewViewport" style="margin-top:10px; background:#fff; border:1px dashed #d8d2c8; border-radius:10px; padding:10px; height:520px; overflow:hidden; display:flex; align-items:center; justify-content:center;">
+    <img id="preview" alt="Preview" style="max-width:100%; max-height:100%; width:auto; height:auto; object-fit:contain; display:none; transform-origin:center center;" />
     <div id="noPreview" class="muted">No preview yet.</div>
   </div>
 
