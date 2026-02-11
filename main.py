@@ -558,12 +558,15 @@ def index():
   <p class="muted">Build: __BUILD_STAMP__</p>
   <p>Upload a clear shelf photo. Preview it and rotate if needed before processing.</p>
 
-  <input id="fileCamera" type="file" accept="image/*" capture="environment" style="display:none" />
-  <input id="fileLibrary" type="file" accept="image/*" style="display:none" />
+<input id="fileCamera" type="file" accept="image/*" capture="environment"
+       style="position:absolute; left:-9999px; width:1px; height:1px; opacity:0;" />
+<input id="fileLibrary" type="file" accept="image/*"
+       style="position:absolute; left:-9999px; width:1px; height:1px; opacity:0;" />
+
 
   <div class="row">
-    <button class="ghost" onclick="chooseCamera()">Take Photo</button>
-    <button class="ghost" onclick="chooseLibrary()">Choose from Library</button>
+    <button type="button" class="ghost" onclick="chooseCamera(event)">Take Photo</button>
+    <button type="button" class="ghost" onclick="chooseLibrary(event)">Choose from Library</button>
   </div>
 
   <div id="fileName" class="muted">No photo selected.</div>
@@ -699,8 +702,18 @@ function setSelectedFile(file) {{
   if (noPrev) noPrev.style.display = "none";
 }}
 
-function chooseCamera() {{ document.getElementById('fileCamera').click(); }}
-function chooseLibrary() {{ document.getElementById('fileLibrary').click(); }}
+function chooseCamera(e) {
+  if (e) e.preventDefault();
+  const el = document.getElementById('fileCamera');
+  if (el) el.click();
+}
+
+function chooseLibrary(e) {
+  if (e) e.preventDefault();
+  const el = document.getElementById('fileLibrary');
+  if (el) el.click();
+}
+
 
 document.getElementById('fileCamera').addEventListener('change', (e) => {{
   setSelectedFile(e.target.files && e.target.files[0]);
@@ -1031,6 +1044,7 @@ async def ocr_paddle(
         "rotation_used": rotation_degrees,
         "lines": lines,
     }
+
 
 
 
