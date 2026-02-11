@@ -650,15 +650,15 @@ let selectedFile = null;
 let currentController = null;
 let rotationDegrees = 0;
 
-function setRotation(deg) {
+function setRotation(deg) {{
   rotationDegrees = ((deg % 360) + 360) % 360;
 
   const inner = document.getElementById('previewInner');
   const label = document.getElementById('rotLabel');
 
   if (label) label.textContent = rotationDegrees + "°";
-  if (inner) inner.style.transform = `rotate(${rotationDegrees}deg)`;
-}
+  if (inner) inner.style.transform = "rotate(" + rotationDegrees + "deg)";
+}}
 
 
 function enableRotateButtons(enabled) {{
@@ -1029,3 +1029,4 @@ async def ocr_paddle(
         "rotation_used": rotation_degrees,
         "lines": lines,
     }
+
