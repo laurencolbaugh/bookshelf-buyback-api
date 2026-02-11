@@ -525,7 +525,7 @@ def resolve_candidate(candidate: Dict, debug_log: Optional[List[Dict]] = None) -
 
 @app.get("/")
 def index():
-    html = f"""
+    html = """
 <!doctype html>
 <html lang="en">
 <head>
@@ -555,7 +555,7 @@ def index():
 </head>
 <body>
   <h1>Bookshelf → ISBN Helper</h1>
-  <p class="muted">Build: {BUILD_STAMP}</p>
+  <p class="muted">Build: __BUILD_STAMP__</p>
   <p>Upload a clear shelf photo. Preview it and rotate if needed before processing.</p>
 
   <input id="fileCamera" type="file" accept="image/*" capture="environment" style="display:none" />
@@ -732,7 +732,7 @@ async function processImage() {{
   formData.append('debug', debugOn ? '1' : '0');
   formData.append('rotation_degrees', String(rotationDegrees));
 
-  status.textContent = 'Processing... (will time out if it takes too long) — build {BUILD_STAMP}';
+  status.textContent = 'Processing... (will time out if it takes too long) — build __BUILD_STAMP__';
   table.style.display = 'none';
   tbody.innerHTML = '';
   isbnBox.style.display = 'none';
@@ -794,7 +794,7 @@ async function processImage() {{
       isbnBox.style.display = 'block';
       copyBtn.style.display = 'inline-block';
       const elapsed = (meta && meta.elapsed_s != null) ? (" (elapsed " + meta.elapsed_s + "s)") : "";
-      status.textContent = "Done. " + isbnList.length + " ISBNs ready to copy. (build {BUILD_STAMP})" + elapsed;
+      status.textContent = "Done. " + isbnList.length + " ISBNs ready to copy. (build __BUILD_STAMP__)" + elapsed;
     }} else {{
       const elapsed = (meta && meta.elapsed_s != null) ? (" (elapsed " + meta.elapsed_s + "s)") : "";
       status.textContent = "Done. No ISBNs resolved — try again with a clearer photo." + elapsed;
@@ -864,6 +864,8 @@ async function copyIsbns() {{
 </body>
 </html>
     """
+        html = html.replace("__BUILD_STAMP__", BUILD_STAMP)
+
 
     return HTMLResponse(
         content=html,
@@ -1029,4 +1031,5 @@ async def ocr_paddle(
         "rotation_used": rotation_degrees,
         "lines": lines,
     }
+
 
