@@ -43,7 +43,7 @@ SPINE_SLICE_OVERLAP_PX = 40         # overlap so text near edges isn't lost
 SPINE_MIN_STRIP_WIDTH = 140         # skip too-thin strips
 
 # Build stamp (lets us confirm the phone is loading the newest HTML)
-BUILD_STAMP = "2026-02-11-A"
+BUILD_STAMP = "2026-02-11-F"
 
 
 @app.get("/check-isbns")
@@ -1029,4 +1029,3 @@ async def ocr_paddle(
         "rotation_used": rotation_degrees,
         "lines": lines,
     }
-
