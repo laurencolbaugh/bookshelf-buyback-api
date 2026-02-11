@@ -43,7 +43,7 @@ SPINE_SLICE_OVERLAP_PX = 40         # overlap so text near edges isn't lost
 SPINE_MIN_STRIP_WIDTH = 140         # skip too-thin strips
 
 # Build stamp (lets us confirm the phone is loading the newest HTML)
-BUILD_STAMP = "2026-02-10-A"
+BUILD_STAMP = "2026-02-11-A"
 
 
 @app.get("/check-isbns")
@@ -574,11 +574,45 @@ def index():
     <div class="muted" style="align-self:center;">Rotation: <span id="rotLabel">0°</span></div>
   </div>
 
-  <!-- Preview viewport: fixed height + overflow hidden so rotation can't cover buttons -->
-  <div id="previewViewport" style="margin-top:10px; background:#fff; border:1px dashed #d8d2c8; border-radius:10px; padding:10px; height:520px; overflow:hidden; display:flex; align-items:center; justify-content:center;">
-    <img id="preview" alt="Preview" style="max-width:100%; max-height:100%; width:auto; height:auto; object-fit:contain; display:none; transform-origin:center center;" />
-    <div id="noPreview" class="muted">No preview yet.</div>
+  <!-- Preview viewport -->
+<div id="previewViewport"
+     style="margin-top:10px;
+            background:#fff;
+            border:1px dashed #d8d2c8;
+            border-radius:10px;
+            height:520px;
+            overflow:hidden;
+            display:flex;
+            align-items:center;
+            justify-content:center;
+            position:relative;">
+
+  <div id="previewInner"
+       style="display:flex;
+              align-items:center;
+              justify-content:center;
+              max-width:100%;
+              max-height:100%;
+              transition: transform 0.15s ease;
+              transform-origin:center center;">
+
+    <img id="preview"
+         alt="Preview"
+         style="max-width:100%;
+                max-height:100%;
+                object-fit:contain;
+                display:none;" />
+
   </div>
+
+  <div id="noPreview"
+       class="muted"
+       style="position:absolute;">
+       No preview yet.
+  </div>
+
+</div>
+
 
   <label class="muted">
     <input type="checkbox" id="debugMode" />
@@ -616,13 +650,16 @@ let selectedFile = null;
 let currentController = null;
 let rotationDegrees = 0;
 
-function setRotation(deg) {{
+function setRotation(deg) {
   rotationDegrees = ((deg % 360) + 360) % 360;
-  const img = document.getElementById('preview');
+
+  const inner = document.getElementById('previewInner');
   const label = document.getElementById('rotLabel');
+
   if (label) label.textContent = rotationDegrees + "°";
-  if (img) img.style.transform = `rotate(${{rotationDegrees}}deg)`;
-}}
+  if (inner) inner.style.transform = `rotate(${rotationDegrees}deg)`;
+}
+
 
 function enableRotateButtons(enabled) {{
   const l = document.getElementById('rotLeft');
@@ -785,8 +822,17 @@ function clearAll() {{
 
   const img = document.getElementById('preview');
   const noPrev = document.getElementById('noPreview');
-  if (img) {{ img.src = ""; img.style.display = "none"; img.style.transform = "rotate(0deg)"; }}
+  
+  if (img) {
+  img.src = "";
+  img.style.display = "none";
+}
+
+const inner = document.getElementById('previewInner');
+if (inner) inner.style.transform = "rotate(0deg)";
+
   if (noPrev) noPrev.style.display = "block";
+  
   enableRotateButtons(false);
   setRotation(0);
 
@@ -983,3 +1029,4 @@ async def ocr_paddle(
         "rotation_used": rotation_degrees,
         "lines": lines,
     }
+
