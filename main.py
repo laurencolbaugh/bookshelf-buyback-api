@@ -878,6 +878,8 @@ async function copyIsbns() {{
 </html>
     """
     html = html.replace("__BUILD_STAMP__", BUILD_STAMP)
+    html = html.replace("{{", "{").replace("}}", "}")
+
 
 
     return HTMLResponse(
@@ -1044,6 +1046,7 @@ async def ocr_paddle(
         "rotation_used": rotation_degrees,
         "lines": lines,
     }
+
 
 
 
