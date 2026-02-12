@@ -32,15 +32,17 @@ paddle_ocr = PaddleOCR(
 # Performance / reliability knobs
 # ---------------------------
 MAX_IMAGE_LONG_EDGE = 1100          # Downscale big iPhone photos before OCR
-OCR_ANGLES = (0,)                   # whole-image 90° is redundant now that slices rotate
+OCR_ANGLES = (0,)                   # We assume text is already left-to-right for the main pipeline
 OCR_TIMEOUT_SECONDS = 6             # Hard timeout per OCR call
 MIN_OCR_CONF = 25                   # Filter low-confidence junk harder
 MAX_CANDIDATES = 10                 # Cap how many candidate lines we try to resolve
 OPENLIB_TIMEOUT = 2                 # Keep OpenLibrary fast; failing fast > hanging
 TOTAL_SOFT_BUDGET_SECONDS = 25      # If we're over budget, stop resolving more candidates
-SPINE_SLICE_COUNT = 6               # how many vertical bands to OCR
-SPINE_SLICE_OVERLAP_PX = 40         # overlap so text near edges isn't lost
-SPINE_MIN_STRIP_WIDTH = 140         # skip too-thin strips
+
+# (Legacy knobs retained; slicing is disabled in the main pipeline for now)
+SPINE_SLICE_COUNT = 6
+SPINE_SLICE_OVERLAP_PX = 40
+SPINE_MIN_STRIP_WIDTH = 140
 
 # Build stamp (lets us confirm the phone is loading the newest HTML)
 BUILD_STAMP = "2026-02-11-F"
@@ -80,13 +82,13 @@ def downscale_for_ocr(image: Image.Image) -> Image.Image:
     return image.resize((new_w, new_h), Image.LANCZOS)
 
 
-# ---------- OCR HELPERS (Tesseract pipeline you already had) ----------
+# ---------- OCR HELPERS (Tesseract pipeline) ----------
 
 def extract_ocr_lines(image: Image.Image) -> List[Dict]:
     """
-    Spine-optimized OCR:
-    1) OCR full image at a couple orientations
-    2) Slice into vertical bands, rotate bands upright, OCR each band
+    Whole-image OCR (no slicing):
+    Assumes the user has oriented the preview so titles read left-to-right
+    before processing.
     Returns a list of text lines with average confidence.
     """
     all_lines: List[Dict] = []
@@ -144,88 +146,16 @@ def extract_ocr_lines(image: Image.Image) -> List[Dict]:
             all_lines.append({"text": full_text, "conf": avg_conf, "angle": angle_label})
 
     def _prep(img: Image.Image) -> Image.Image:
-        """Preprocess for better spine text clarity."""
+        """Preprocess for better text clarity."""
         g = img.convert("L")
         g = ImageEnhance.Contrast(g).enhance(2.2)
         g = g.filter(ImageFilter.SHARPEN)
         g = g.filter(ImageFilter.MedianFilter(size=3))
         return g
 
-    # --- Pass A: Whole-image OCR (quick)
     for angle in OCR_ANGLES:
         rotated = image.rotate(angle, expand=True)
         _run_ocr(_prep(rotated), angle_label=f"whole_{angle}")
-
-    # --- Pass B: Spine slicing OCR (high value for shelves)
-    w, h = image.size
-    slice_count = max(6, int(SPINE_SLICE_COUNT))
-    base_strip_w = max(1, w // slice_count)
-
-    for i in range(slice_count):
-        left = i * base_strip_w - SPINE_SLICE_OVERLAP_PX
-        right = (i + 1) * base_strip_w + SPINE_SLICE_OVERLAP_PX
-        left = max(0, left)
-        right = min(w, right)
-
-        if (right - left) < SPINE_MIN_STRIP_WIDTH:
-            continue
-
-        strip = image.crop((left, 0, right, h))
-
-        # Rotate strip so vertical spine text becomes horizontal.
-        for rot, label in ((90, "slice_90"),):
-            rotated_strip = strip.rotate(rot, expand=True)
-
-            try:
-                img = _prep(rotated_strip)
-                data = pytesseract.image_to_data(
-                    img,
-                    output_type=pytesseract.Output.DICT,
-                    config="--psm 7 --oem 3",   # single line works well for spines
-                    timeout=OCR_TIMEOUT_SECONDS,
-                )
-            except RuntimeError as e:
-                logging.error("OCR timeout/failure (%s): %s", label, e)
-                continue
-            except Exception as e:
-                logging.error("OCR failure (%s): %s", label, e)
-                continue
-
-            n = len(data.get("text", []))
-            lines: Dict[tuple, Dict] = {}
-
-            for j in range(n):
-                raw = data["text"][j]
-                if not raw:
-                    continue
-                text = raw.strip()
-                if not text:
-                    continue
-
-                conf_str = data.get("conf", ["-1"] * n)[j]
-                try:
-                    conf = float(conf_str)
-                except (ValueError, TypeError):
-                    conf = -1.0
-                if conf < 0:
-                    continue
-
-                key = (
-                    data.get("block_num", [0] * n)[j],
-                    data.get("par_num", [0] * n)[j],
-                    data.get("line_num", [0] * n)[j],
-                )
-                if key not in lines:
-                    lines[key] = {"texts": [], "confs": []}
-                lines[key]["texts"].append(text)
-                lines[key]["confs"].append(conf)
-
-            for _, content in lines.items():
-                full_text = " ".join(content["texts"]).strip()
-                if len(full_text) < 3:
-                    continue
-                avg_conf = sum(content["confs"]) / max(1, len(content["confs"]))
-                all_lines.append({"text": full_text, "conf": avg_conf, "angle": f"{label}_band{i}"})
 
     if not all_lines:
         return []
@@ -242,9 +172,8 @@ def extract_ocr_lines(image: Image.Image) -> List[Dict]:
         if key in seen:
             continue
         seen.add(key)
-        deduped.append({"text": text, "conf": entry["conf"]})
+        deduped.append({"text": text, "conf": entry["conf"], "angle": entry.get("angle", "")})
 
-    # Keep only top N lines to avoid explosion
     return deduped[: max(40, MAX_CANDIDATES * 3)]
 
 
@@ -317,7 +246,7 @@ def normalize_isbn(isbn: str) -> Optional[str]:
 
 def normalize_ocr_text(s: str) -> str:
     """
-    Repair common OCR spine breakage and normalize for searching.
+    Repair common OCR breakage and normalize for searching.
     """
     s = (s or "").strip().lower()
     s = s.replace("\n", " ")
@@ -533,36 +462,35 @@ def index():
   <title>Bookshelf → ISBN Helper</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body {{ font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif; padding: 16px; background:#faf7f2; color:#222; }}
-    h1 {{ font-size: 1.3rem; margin-bottom: 0.3rem; }}
-    p {{ font-size: 0.9rem; margin-top: 0; margin-bottom: 0.8rem; }}
-    button {{ padding: 10px 14px; border: none; border-radius: 8px; cursor: pointer; font-size: 0.95rem; }}
-    button.primary {{ background: #4b6b5c; color: #fff; }}
-    button.secondary {{ background: #e6e2db; color: #333; margin-left: 8px; }}
-    button.ghost {{ background: #fff; color:#333; border:1px solid #d8d2c8; }}
-    .row {{ display:flex; gap:10px; flex-wrap:wrap; margin: 10px 0 12px; }}
-    .row button {{ flex: 1 1 160px; }}
-    table {{ border-collapse: collapse; width: 100%; font-size: 0.8rem; margin-top: 12px; }}
-    th, td {{ border: 1px solid #ddd; padding: 6px; text-align: left; }}
-    th {{ background: #f1ece4; }}
-    #status {{ font-size: 0.85rem; margin-top: 8px; color:#555; white-space: pre-line; }}
-    #isbnBox {{ width: 100%; margin-top: 8px; font-size: 0.8rem; padding:8px; box-sizing:border-box; }}
-    #fileName {{ font-size: 0.85rem; color:#333; margin-top: 6px; }}
-    .muted {{ color:#666; font-size:0.85rem; }}
-    #debugBox {{ width: 100%; margin-top: 10px; font-size: 0.75rem; padding:8px; box-sizing:border-box; display:none; }}
-    label.muted {{ display:block; margin-top: 6px; }}
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif; padding: 16px; background:#faf7f2; color:#222; }
+    h1 { font-size: 1.3rem; margin-bottom: 0.3rem; }
+    p { font-size: 0.9rem; margin-top: 0; margin-bottom: 0.8rem; }
+    button { padding: 10px 14px; border: none; border-radius: 8px; cursor: pointer; font-size: 0.95rem; }
+    button.primary { background: #4b6b5c; color: #fff; }
+    button.secondary { background: #e6e2db; color: #333; margin-left: 8px; }
+    button.ghost { background: #fff; color:#333; border:1px solid #d8d2c8; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; margin: 10px 0 12px; }
+    .row button { flex: 1 1 160px; }
+    table { border-collapse: collapse; width: 100%; font-size: 0.8rem; margin-top: 12px; }
+    th, td { border: 1px solid #ddd; padding: 6px; text-align: left; }
+    th { background: #f1ece4; }
+    #status { font-size: 0.85rem; margin-top: 8px; color:#555; white-space: pre-line; }
+    #isbnBox { width: 100%; margin-top: 8px; font-size: 0.8rem; padding:8px; box-sizing:border-box; }
+    #fileName { font-size: 0.85rem; color:#333; margin-top: 6px; }
+    .muted { color:#666; font-size:0.85rem; }
+    #debugBox { width: 100%; margin-top: 10px; font-size: 0.75rem; padding:8px; box-sizing:border-box; display:none; }
+    label.muted { display:block; margin-top: 6px; }
   </style>
 </head>
 <body>
   <h1>Bookshelf → ISBN Helper</h1>
   <p class="muted">Build: __BUILD_STAMP__</p>
-  <p>Upload a clear shelf photo. Preview it and rotate if needed before processing.</p>
+  <p>Rotate the preview so titles read left to right, then click Process Photo.</p>
 
-<input id="fileCamera" type="file" accept="image/*" capture="environment"
-       style="position:absolute; left:-9999px; width:1px; height:1px; opacity:0;" />
-<input id="fileLibrary" type="file" accept="image/*"
-       style="position:absolute; left:-9999px; width:1px; height:1px; opacity:0;" />
-
+  <input id="fileCamera" type="file" accept="image/*" capture="environment"
+         style="position:absolute; left:-9999px; width:1px; height:1px; opacity:0;" />
+  <input id="fileLibrary" type="file" accept="image/*"
+         style="position:absolute; left:-9999px; width:1px; height:1px; opacity:0;" />
 
   <div class="row">
     <button type="button" class="ghost" onclick="chooseCamera(event)">Take Photo</button>
@@ -578,44 +506,43 @@ def index():
   </div>
 
   <!-- Preview viewport -->
-<div id="previewViewport"
-     style="margin-top:10px;
-            background:#fff;
-            border:1px dashed #d8d2c8;
-            border-radius:10px;
-            height:520px;
-            overflow:hidden;
-            display:flex;
-            align-items:center;
-            justify-content:center;
-            position:relative;">
-
-  <div id="previewInner"
-       style="display:flex;
+  <div id="previewViewport"
+       style="margin-top:10px;
+              background:#fff;
+              border:1px dashed #d8d2c8;
+              border-radius:10px;
+              height:520px;
+              overflow:hidden;
+              display:flex;
               align-items:center;
               justify-content:center;
-              max-width:100%;
-              max-height:100%;
-              transition: transform 0.15s ease;
-              transform-origin:center center;">
+              position:relative;">
 
-    <img id="preview"
-         alt="Preview"
-         style="max-width:100%;
+    <div id="previewInner"
+         style="display:flex;
+                align-items:center;
+                justify-content:center;
+                max-width:100%;
                 max-height:100%;
-                object-fit:contain;
-                display:none;" />
+                transition: transform 0.15s ease;
+                transform-origin:center center;">
+
+      <img id="preview"
+           alt="Preview"
+           style="max-width:100%;
+                  max-height:100%;
+                  object-fit:contain;
+                  display:none;" />
+
+    </div>
+
+    <div id="noPreview"
+         class="muted"
+         style="position:absolute;">
+         No preview yet.
+    </div>
 
   </div>
-
-  <div id="noPreview"
-       class="muted"
-       style="position:absolute;">
-       No preview yet.
-  </div>
-
-</div>
-
 
   <label class="muted">
     <input type="checkbox" id="debugMode" />
@@ -653,7 +580,7 @@ let selectedFile = null;
 let currentController = null;
 let rotationDegrees = 0;
 
-function setRotation(deg) {{
+function setRotation(deg) {
   rotationDegrees = ((deg % 360) + 360) % 360;
 
   const inner = document.getElementById('previewInner');
@@ -661,20 +588,19 @@ function setRotation(deg) {{
 
   if (label) label.textContent = rotationDegrees + "°";
   if (inner) inner.style.transform = "rotate(" + rotationDegrees + "deg)";
-}}
+}
 
-
-function enableRotateButtons(enabled) {{
+function enableRotateButtons(enabled) {
   const l = document.getElementById('rotLeft');
   const r = document.getElementById('rotRight');
   if (l) l.disabled = !enabled;
   if (r) r.disabled = !enabled;
-}}
+}
 
-function rotateLeft() {{ setRotation(rotationDegrees - 90); }}
-function rotateRight() {{ setRotation(rotationDegrees + 90); }}
+function rotateLeft() { setRotation(rotationDegrees - 90); }
+function rotateRight() { setRotation(rotationDegrees + 90); }
 
-function setSelectedFile(file) {{
+function setSelectedFile(file) {
   selectedFile = file || null;
 
   const fileNameEl = document.getElementById('fileName');
@@ -683,24 +609,24 @@ function setSelectedFile(file) {{
   const img = document.getElementById('preview');
   const noPrev = document.getElementById('noPreview');
 
-  if (!selectedFile) {{
-    if (img) {{ img.src = ""; img.style.display = "none"; }}
+  if (!selectedFile) {
+    if (img) { img.src = ""; img.style.display = "none"; }
     if (noPrev) noPrev.style.display = "block";
     enableRotateButtons(false);
     setRotation(0);
     return;
-  }}
+  }
 
   setRotation(0);
   enableRotateButtons(true);
 
   const url = URL.createObjectURL(selectedFile);
-  if (img) {{
+  if (img) {
     img.src = url;
     img.style.display = "block";
-  }}
+  }
   if (noPrev) noPrev.style.display = "none";
-}}
+}
 
 function chooseCamera(e) {
   if (e) e.preventDefault();
@@ -714,15 +640,14 @@ function chooseLibrary(e) {
   if (el) el.click();
 }
 
-
-document.getElementById('fileCamera').addEventListener('change', (e) => {{
+document.getElementById('fileCamera').addEventListener('change', (e) => {
   setSelectedFile(e.target.files && e.target.files[0]);
-}});
-document.getElementById('fileLibrary').addEventListener('change', (e) => {{
+});
+document.getElementById('fileLibrary').addEventListener('change', (e) => {
   setSelectedFile(e.target.files && e.target.files[0]);
-}});
+});
 
-async function processImage() {{
+async function processImage() {
   const status = document.getElementById('status');
   const table = document.getElementById('resultsTable');
   const tbody = table.querySelector('tbody');
@@ -732,10 +657,10 @@ async function processImage() {{
 
   const debugOn = document.getElementById('debugMode')?.checked;
 
-  if (!selectedFile) {{
+  if (!selectedFile) {
     status.textContent = 'Choose a photo first.';
     return;
-  }}
+  }
 
   if (currentController) currentController.abort();
   currentController = new AbortController();
@@ -757,74 +682,74 @@ async function processImage() {{
   const timeoutMs = 35000;
   const timeoutId = setTimeout(() => currentController.abort(), timeoutMs);
 
-  try {{
-    const resp = await fetch('/api/bookshelf', {{
+  try {
+    const resp = await fetch('/api/bookshelf', {
       method: 'POST',
       body: formData,
       signal: currentController.signal
-    }});
+    });
 
-    if (!resp.ok) {{
+    if (!resp.ok) {
       const errText = await resp.text().catch(() => '');
       console.error('Server error:', errText);
       status.textContent = 'Server returned an error. Try a closer / clearer photo.';
       return;
-    }}
+    }
 
     const data = await resp.json();
     const books = data.books || [];
     const meta = data.meta || null;
 
-    if (debugOn && data.debug) {{
+    if (debugOn && data.debug) {
       debugBox.value = JSON.stringify(data.debug, null, 2);
       debugBox.style.display = 'block';
-    }}
+    }
 
-    if (!books.length) {{
+    if (!books.length) {
       status.textContent = 'No candidates detected. Try a closer or clearer shot.';
       return;
-    }}
+    }
 
     let isbnList = [];
-    books.forEach((b, idx) => {{
+    books.forEach((b, idx) => {
       const tr = document.createElement('tr');
       tr.innerHTML = `
-        <td>${{idx + 1}}</td>
-        <td>${{(b.title || '').replace(/</g,'&lt;')}}</td>
-        <td>${{(b.author || '').replace(/</g,'&lt;')}}</td>
-        <td>${{b.isbn || ''}}</td>
-        <td>${{(b.confidence != null) ? (b.confidence * 100).toFixed(0) + '%' : ''}}</td>
-        <td>${{b.source || ''}}</td>
+        <td>${idx + 1}</td>
+        <td>${(b.title || '').replace(/</g,'&lt;')}</td>
+        <td>${(b.author || '').replace(/</g,'&lt;')}</td>
+        <td>${b.isbn || ''}</td>
+        <td>${(b.confidence != null) ? (b.confidence * 100).toFixed(0) + '%' : ''}</td>
+        <td>${b.source || ''}</td>
       `;
       tbody.appendChild(tr);
       if (b.isbn) isbnList.push(b.isbn);
-    }});
+    });
 
     table.style.display = 'table';
 
-    if (isbnList.length) {{
+    if (isbnList.length) {
       isbnBox.value = isbnList.join('\\n');
       isbnBox.style.display = 'block';
       copyBtn.style.display = 'inline-block';
       const elapsed = (meta && meta.elapsed_s != null) ? (" (elapsed " + meta.elapsed_s + "s)") : "";
       status.textContent = "Done. " + isbnList.length + " ISBNs ready to copy. (build __BUILD_STAMP__)" + elapsed;
-    }} else {{
+    } else {
       const elapsed = (meta && meta.elapsed_s != null) ? (" (elapsed " + meta.elapsed_s + "s)") : "";
       status.textContent = "Done. No ISBNs resolved — try again with a clearer photo." + elapsed;
-    }}
-  }} catch (e) {{
-    if (e.name === 'AbortError') {{
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') {
       status.textContent = 'Timed out. Try a closer photo, or crop to fewer books per image.';
-    }} else {{
+    } else {
       console.error(e);
       status.textContent = 'Unexpected error. Try again.';
-    }}
-  }} finally {{
+    }
+  } finally {
     clearTimeout(timeoutId);
-  }}
-}}
+  }
+}
 
-function clearAll() {{
+function clearAll() {
   document.getElementById('fileCamera').value = '';
   document.getElementById('fileLibrary').value = '';
   selectedFile = null;
@@ -835,17 +760,17 @@ function clearAll() {{
 
   const img = document.getElementById('preview');
   const noPrev = document.getElementById('noPreview');
-  
-  if (img) {
-  img.src = "";
-  img.style.display = "none";
-}
 
-const inner = document.getElementById('previewInner');
-if (inner) inner.style.transform = "rotate(0deg)";
+  if (img) {
+    img.src = "";
+    img.style.display = "none";
+  }
+
+  const inner = document.getElementById('previewInner');
+  if (inner) inner.style.transform = "rotate(0deg)";
 
   if (noPrev) noPrev.style.display = "block";
-  
+
   enableRotateButtons(false);
   setRotation(0);
 
@@ -860,27 +785,24 @@ if (inner) inner.style.transform = "rotate(0deg)";
   debugBox.value = '';
 
   if (currentController) currentController.abort();
-}}
+}
 
-async function copyIsbns() {{
+async function copyIsbns() {
   const isbnBox = document.getElementById('isbnBox');
   isbnBox.select();
   isbnBox.setSelectionRange(0, 99999);
-  try {{
+  try {
     await navigator.clipboard.writeText(isbnBox.value);
     document.getElementById('status').textContent = 'ISBNs copied to clipboard.';
-  }} catch {{
+  } catch {
     document.getElementById('status').textContent = 'Select + copy manually (clipboard blocked).';
-  }}
-}}
+  }
+}
 </script>
 </body>
 </html>
     """
     html = html.replace("__BUILD_STAMP__", BUILD_STAMP)
-    html = html.replace("{{", "{").replace("}}", "}")
-
-
 
     return HTMLResponse(
         content=html,
@@ -902,8 +824,8 @@ async def process_bookshelf(
 ):
     """
     Core OCR → candidate → lookup pipeline.
-    Hardened to avoid long hangs on large photos.
     Debug mode returns extra info (first few lookups + OCR lines).
+    Assumes user has oriented titles left-to-right before processing.
     """
     started = time.time()
     debug_on = (debug == "1")
@@ -929,7 +851,11 @@ async def process_bookshelf(
 
     if debug_on:
         debug_blob["ocr_lines"] = [
-            {"text": _short(x.get("text", ""), 120), "conf": round(float(x.get("conf", 0.0)), 1), "angle": x.get("angle", "")}
+            {
+                "text": _short(x.get("text", ""), 120),
+                "conf": round(float(x.get("conf", 0.0)), 1),
+                "angle": x.get("angle", ""),
+            }
             for x in (ocr_lines[:25] if ocr_lines else [])
         ]
 
@@ -1046,8 +972,3 @@ async def ocr_paddle(
         "rotation_used": rotation_degrees,
         "lines": lines,
     }
-
-
-
-
-
